@@ -267,7 +267,20 @@ fixed it.
     perf record -e cpu-clock -F 299 --call-graph dwarf \
         -- python3-dbg profile_pyflate.py --variant bm_pyflate --loops 2
 
-    1,964 samples; flame graph in results/pyflate_baseline_flame.svg
+    1,964 samples; the ranking below is from this profile.
+
+The committed flame graphs were later regenerated with frame-pointer
+unwinding against the STOCK python3, for the reason the next paragraph
+gives: the debug allocator is ~12% of this profile, and it held the
+perf-measured speedup to 1.54x against pyperf's 1.61x. On the stock
+interpreter perf reports 1.59x. Frame pointers are safe there precisely
+because the stock build does not paint memory, though Ubuntu's
+-fomit-frame-pointer costs stack depth in exchange.
+
+    perf record -e cpu-clock -F 999 -g \
+        -- python3 profile_pyflate.py --variant bm_pyflate --loops 5
+
+    flame graph in results/pyflate_baseline_flame.svg
 
 Self time:
 
@@ -291,8 +304,13 @@ About 12% of this is measurement artifact and must be discounted:
 _PyMem_DebugCheckAddress, read_size_t, _PyMem_DebugRawAlloc,
 arena_map_get, PyGILState_Check and write_size_t are all debug-allocator
 bookkeeping that does not exist in the python3 build used for timing.
-The debug build is used only because it carries the symbols DWARF
+The debug build was used only because it carries the symbols DWARF
 unwinding requires.
+
+That discount is no longer a matter of judgement. Re-profiling the
+stock interpreter removed those rows entirely and moved the
+perf-measured speedup from 1.54x to 1.59x, against pyperf's 1.61x, so
+the ~12% estimate is corroborated rather than merely asserted.
 
 Discounting those, the remainder independently corroborates cProfile
 and names at C level the work that three optimizations removed:
