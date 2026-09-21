@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# perf / profiling raw artifacts (large, regenerable)
+perf.data
+perf.data.old
+perf.folded
+*.perf
+out.perf
+
+# Benchmark render output
+*.ppm
+
+# Local tooling (downloaded binaries, not part of the project)
+.tools/
+
+# OS
+.DS_Store
