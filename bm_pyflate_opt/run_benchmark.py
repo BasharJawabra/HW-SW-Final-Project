@@ -287,7 +287,7 @@ def extra_length_bits(n):
 
 
 def move_to_front(l, c):
-    l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
+    l.insert(0, l.pop(c))
 
 
 def bwt_transform(L):
