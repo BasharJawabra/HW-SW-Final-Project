@@ -40,6 +40,7 @@ module huffman_decoder_tb;
     // Groups present in the generated vectors, which is fewer than the six
     // the DUT supports.
     localparam int VEC_GROUPS   = 2;
+    localparam int GROUP_LEN    = 50;
 
     localparam int MAX_WORDS     = 4096;
     localparam int MAX_EXPECTED  = 8192;
@@ -120,6 +121,22 @@ module huffman_decoder_tb;
     logic backpressure;
 
     task automatic load_vectors();
+        // The arrays are sized for the worst case, so every file is shorter
+        // than the array it fills and $readmemh warns accordingly. Clearing
+        // first means the unfilled tail reads as zero instead of X, so a
+        // genuinely missing file shows up as an empty-vector failure rather
+        // than as X propagating quietly into the DUT.
+        for (int i = 0; i < VEC_GROUPS*MAX_CODE_LEN; i++) begin
+            vec_first[i] = '0;
+            vec_count[i] = '0;
+            vec_base[i]  = '0;
+        end
+        for (int i = 0; i < VEC_GROUPS*NUM_SYMBOLS; i++) vec_sym[i] = '0;
+        for (int i = 0; i < MAX_SELECTORS; i++)          vec_sel[i] = '0;
+        for (int i = 0; i < MAX_WORDS; i++)              vec_word[i] = '0;
+        for (int i = 0; i < MAX_EXPECTED; i++)           vec_exp[i] = '0;
+        for (int i = 0; i < 4; i++)                      vec_meta[i] = '0;
+
         $readmemh("hw/vectors/meta.hex",       vec_meta);
         $readmemh("hw/vectors/first_code.hex", vec_first);
         $readmemh("hw/vectors/count.hex",      vec_count);
@@ -167,10 +184,12 @@ module huffman_decoder_tb;
             sym_we = 1'b0;
         end
 
-        for (int s = 0; s < MAX_SELECTORS; s++) begin
+        // Only the selectors the stream actually uses, one per GROUP_LEN
+        // symbols including the group EOB falls in.
+        for (int s = 0; s < (exp_symbols + GROUP_LEN) / GROUP_LEN; s++) begin
             @(negedge clk);
             sel_we   = 1'b1;
-            sel_addr = s[14:0];
+            sel_addr = s;
             sel_data = vec_sel[s];
         end
         @(negedge clk);
