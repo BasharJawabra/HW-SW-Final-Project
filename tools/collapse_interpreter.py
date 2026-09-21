@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collapse CPython's call plumbing in folded stacks.
+"""Collapse CPython's call plumbing and unresolved towers in folded stacks.
 
 Reads folded stacks (the output of stackcollapse-perf.pl) on stdin and
 writes folded stacks on stdout, so it drops into a flame graph pipeline
@@ -58,6 +58,13 @@ attributed to [python call], since _PyEval_EvalFrameDefault is where
 the eval loop runs. Per-symbol self time remains available
 unmodified in the `perf report` output saved alongside these graphs.
 
+Runs of [unknown] are collapsed the same way, into [unresolved]. Those
+are an artefact of frame-pointer unwinding against a binary built with
+-fomit-frame-pointer: the unwinder walks whatever is on the stack and
+emits addresses that resolve to nothing. They are collapsed rather than
+deleted, so the samples and their share stay visible and honestly
+labelled instead of being silently reassigned.
+
 Usage:
     stackcollapse-perf.pl out.perf | collapse_interpreter.py | flamegraph.pl
 """
@@ -105,21 +112,45 @@ PLUMBING = frozenset((
 
 COLLAPSED = "[python call]"
 
+# Frame-pointer unwinding on a binary built with -fomit-frame-pointer
+# walks whatever happens to sit on the stack and emits long runs of
+# addresses that resolve to nothing. Measured on the frame-pointer
+# profiles: the optimized raytrace graph was 128 rows tall (perf's stack
+# limit) with 126 of its 180 boxes named [unknown], i.e. a single tower
+# of unresolvable frames. Collapsing each run to one frame removes the
+# tower while keeping the samples and stating plainly that the frames
+# were not resolved.
+UNRESOLVED = frozenset(("[unknown]",))
+
+UNRESOLVED_MARKER = "[unresolved]"
+
+# Each group maps a set of frame names to the single frame that replaces
+# a consecutive run of them.
+GROUPS = ((PLUMBING, COLLAPSED), (UNRESOLVED, UNRESOLVED_MARKER))
+
 
 def collapse(stack):
-    """Replace each run of plumbing frames with a single frame."""
+    """Replace each run of same-group frames with a single frame."""
     out = []
-    in_run = False
+    run = None
     for frame in stack:
-        if frame in PLUMBING:
-            # Emit the marker once per run, not once per frame. This is
-            # what turns the repeating cycle into a single frame.
-            if not in_run:
-                out.append(COLLAPSED)
-                in_run = True
-        else:
+        group = None
+        for members, marker in GROUPS:
+            if frame in members:
+                group = marker
+                break
+
+        if group is None:
             out.append(frame)
-            in_run = False
+            run = None
+        elif group != run:
+            # Emit the marker once per run, not once per frame. This is
+            # what turns a repeating cycle or an unresolved tower into a
+            # single frame. A run ends when the group changes, so
+            # plumbing directly above an unresolved tower stays visible
+            # as two frames rather than merging into one.
+            out.append(group)
+            run = group
     return out
 
 
