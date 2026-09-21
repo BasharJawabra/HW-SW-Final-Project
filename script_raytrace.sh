@@ -128,16 +128,54 @@ stage_flame() {
     fi
 
     # cpu-clock rather than cycles: the QEMU guest exposes no PMU.
-    # DWARF rather than frame pointers: on python3-dbg the frame-pointer
-    # unwinder reports allocator fill bytes (0xFD / 0xDD) as return
-    # addresses, which makes the resulting graph meaningless.
-    perf record -e cpu-clock -F 299 --call-graph dwarf \
-        -o /tmp/raytrace_dwarf.data \
-        -- python3-dbg "$REPO/profile_raytrace.py" \
-              --variant "$BASE_DIR" --loops 3
+    #
+    # Frame-pointer unwinding (-g) on the STOCK interpreter. The two
+    # choices are tied together and cannot be made separately:
+    #
+    #   * -g must not be combined with python3-dbg. The debug build
+    #     paints memory with 0xFD (PYMEM_FORBIDDENBYTE) and 0xDD
+    #     (PYMEM_DEADBYTE), and the frame-pointer unwinder walks that
+    #     painted memory and reports the fill bytes as return addresses
+    #     (0xfdfdfdfdfd000053 and similar). See section 1b of
+    #     results/raytrace_perf_baseline.txt. Those graphs are garbage,
+    #     not merely shallow.
+    #
+    #   * DWARF unwinding needs debug information, which the stock
+    #     interpreter does not carry, so dropping python3-dbg means
+    #     dropping DWARF with it.
+    #
+    # What this configuration buys: the profile now measures the same
+    # interpreter that produced the headline timings, so the ~12%
+    # debug-allocator overhead (_PyMem_DebugCheckAddress, read_size_t,
+    # write_size_t) is gone and the perf-attributed speedup should agree
+    # with pyperf instead of reading low.
+    #
+    # What it costs: Ubuntu builds python3 with -fomit-frame-pointer, so
+    # there are frequently no frame pointers to walk and stacks come
+    # back short, sometimes only the leaf. The stock binary is also
+    # stripped, so static internal functions resolve as [unknown].
+    # Frame pointers carry no per-sample stack snapshot, which is why
+    # the rate and loop count go back up: DWARF forced them down to keep
+    # perf.data manageable.
+    perf record -e cpu-clock -F 999 -g \
+        -o /tmp/raytrace_fp.data \
+        -- python3 "$REPO/profile_raytrace.py" \
+              --variant "$BASE_DIR" --loops 5
 
-    # Two separate things make a DWARF-unwound CPython flame graph
-    # unreadable, and they need different fixes.
+    # The interpreter collapse still applies to whatever call chain does
+    # come back. Its measured justification was taken from the DWARF
+    # profiles, where reaching one Python call cost a repeating cycle of
+    # seven C frames (_PyEval_Vector, _PyEval_EvalFrame,
+    # _PyEval_EvalFrameDefault, call_function, PyObject_Vectorcall,
+    # _PyObject_VectorcallTstate, _PyFunction_Vectorcall) and
+    # _PyEval_Vector appeared 809 times in a 127-row graph. With frame
+    # pointers the stacks are shorter, so the filter has less to do, but
+    # it is a no-op when the pattern is absent and stays in the pipeline
+    # so both stages render identically.
+    #
+    # stackcollapse-recursive.pl is not a substitute: it merges only
+    # ADJACENT duplicate frames, and this is a cycle of seven distinct
+    # names. Sample counts are preserved exactly either way.
     #
     # HEIGHT, and the box count that follows from it. Reaching one Python
     # call costs a cycle of seven C frames (_PyEval_Vector,
@@ -147,33 +185,31 @@ stage_flame() {
     # Python call depth. Measured on the previous graph: _PyEval_Vector
     # appeared 809 times and the image was 127 rows tall.
     #
-    # Note that stackcollapse-recursive.pl does NOT help here. It merges
-    # only ADJACENT duplicate frames, and this is a cycle of seven
-    # distinct names with no adjacent duplicates, so it collapses
-    # nothing. tools/collapse_interpreter.py folds each run of plumbing
-    # frames into one [python call] frame instead, which also merges
-    # identical leaves that were previously scattered across hundreds of
-    # spine depths. Sample counts are preserved exactly.
-    #
-    # WIDTH. Even after that, sub-1% frames remain, and at 9,525 boxes
-    # 92% of them were narrower than 1%. A box that thin cannot hold a
-    # label, and those boxes are most of the 1.8 MB file. --minwidth
-    # drops them.
+    # Sub-1% frames are too thin to carry a label and are most of the
+    # file size, so they are dropped rather than rendered.
     local minwidth=1
 
-    perf script -i /tmp/raytrace_dwarf.data > /tmp/raytrace.perf
+    perf script -i /tmp/raytrace_fp.data > /tmp/raytrace.perf
     "$fg/stackcollapse-perf.pl" /tmp/raytrace.perf \
         | "$REPO/tools/collapse_interpreter.py" > /tmp/raytrace.folded
     "$fg/flamegraph.pl" \
-        --title "raytrace baseline (cpu-clock, DWARF unwind)" \
-        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --title "raytrace baseline (cpu-clock, frame pointers)" \
+        --subtitle "stock python3; frames under ${minwidth}% omitted" \
         --minwidth "$minwidth" \
         /tmp/raytrace.folded > "$RESULTS/raytrace_baseline_flame.svg"
 
     echo "wrote $RESULTS/raytrace_baseline_flame.svg"
 
+    # How deep the stacks actually came back. With -fomit-frame-pointer
+    # this is the number that decides whether the graph is usable, so it
+    # is reported rather than left for the reader to discover.
+    say "stack depth returned by the unwinder"
+    awk -F';' '{d=NF; s+=d; n++; if(d>m)m=d}
+               END {printf "mean %.1f frames, max %d, over %d stacks\n", s/n, m, n}' \
+        /tmp/raytrace.folded
+
     say "perf self-time ranking"
-    perf report -i /tmp/raytrace_dwarf.data --stdio --no-children -g none \
+    perf report -i /tmp/raytrace_fp.data --stdio --no-children -g none \
         2>/dev/null | head -30
 }
 
@@ -192,19 +228,31 @@ stage_flamecmp() {
     # Both profiles MUST use identical collection parameters, or the
     # difference between them reflects the settings rather than the
     # optimizations. The baseline is regenerated here for that reason.
-    local loops=3 freq=299
+    #
+    # -g on stock python3 rather than DWARF on python3-dbg; see
+    # stage_flame for why those two choices are inseparable and what the
+    # trade is. Frame pointers store no per-sample stack snapshot, so
+    # the rate and loop count are higher than the DWARF runs needed.
+    local loops=5 freq=999
 
     local variant
     for variant in "$BASE_DIR" "$OPT_DIR"; do
         echo "--- profiling $variant ---"
-        perf record -e cpu-clock -F "$freq" --call-graph dwarf \
+        perf record -e cpu-clock -F "$freq" -g \
             -o "/tmp/${variant}.data" \
-            -- python3-dbg "$REPO/profile_raytrace.py" \
+            -- python3 "$REPO/profile_raytrace.py" \
                   --variant "$variant" --loops "$loops"
         perf script -i "/tmp/${variant}.data" > "/tmp/${variant}.perf"
         "$fg/stackcollapse-perf.pl" "/tmp/${variant}.perf" \
             | "$REPO/tools/collapse_interpreter.py" \
             > "/tmp/${variant}.folded"
+
+        # Frame pointers may be absent, in which case stacks come back
+        # only a frame or two deep and the graph degenerates. Report it
+        # per variant so that is visible immediately.
+        awk -F';' '{d=NF; s+=d; n++; if(d>m)m=d}
+                   END {printf "  %d stacks, mean depth %.1f, max %d\n",
+                                n, s/n, m}' "/tmp/${variant}.folded"
     done
 
     # collapse_interpreter.py (see stage_flame) fixes the height. What
@@ -232,16 +280,16 @@ stage_flamecmp() {
     echo "minwidth: baseline ${base_mw}%, optimized ${opt_mw}%" \
          "(equal absolute time)"
 
-    local sub="interpreter call frames collapsed; frames under 1% of baseline time omitted"
+    local sub="stock python3; frames under 1% of baseline time omitted"
 
     "$fg/flamegraph.pl" \
-        --title "raytrace BASELINE (cpu-clock, DWARF unwind)" \
+        --title "raytrace BASELINE (cpu-clock, frame pointers)" \
         --subtitle "$sub" \
         --minwidth "$base_mw" \
         "/tmp/$BASE_DIR.folded" > "$RESULTS/raytrace_baseline_flame.svg"
 
     "$fg/flamegraph.pl" \
-        --title "raytrace OPTIMIZED (cpu-clock, DWARF unwind)" \
+        --title "raytrace OPTIMIZED (cpu-clock, frame pointers)" \
         --subtitle "$sub" \
         --minwidth "$opt_mw" \
         "/tmp/$OPT_DIR.folded" > "$RESULTS/raytrace_optimized_flame.svg"
