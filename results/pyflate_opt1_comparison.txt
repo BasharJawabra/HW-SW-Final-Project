@@ -1,0 +1,95 @@
+Pyflate Optimization 1: Inline the Bit-Mask Helper
+==================================================
+
+Date   : 2026-09-21
+Commit : 9613bce
+File   : bm_pyflate_opt/run_benchmark.py
+Target : Bitfield.snoopbits, Bitfield.readbits,
+         RBitfield.snoopbits, RBitfield.readbits
+
+
+The change
+----------
+
+BitfieldBase._mask is a one-line helper:
+
+    def _mask(self, n):
+        return (1 << n) - 1
+
+All five of its call sites were replaced with the expression itself. In
+RBitfield.readbits, which called it twice for the same n, the value is
+now computed once into a local:
+
+    def readbits(self, n=8):
+        if n > self.bits:
+            self.needbits(n)
+        mask = (1 << n) - 1
+        r = (self.bitfield >> (self.bits - n)) & mask
+        self.bits -= n
+        self.bitfield &= ~(mask << self.bits)
+        return r
+
+The _mask method definition is retained; it is part of BitfieldBase's
+interface and costs nothing while unused.
+
+
+Rationale
+---------
+
+cProfile counted 655,017 calls to _mask for 0.128 s of self time. That
+count is exactly accounted for by its call sites:
+
+    snoopbits : 341,601 calls x 1 mask =  341,601
+    readbits  : 156,708 calls x 2 masks = 313,416
+                                          -------
+                                          655,017
+
+The body is a single shift and subtract. The Python call protocol around
+it - allocating a frame, building its locals, deallocating it - costs
+substantially more than the arithmetic. This is the same lever that
+produced optimization 2 on raytrace, applied to unrelated code.
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    baseline  : 1.11 sec +- 0.01 sec
+    optimized : 1.04 sec +- 0.01 sec
+
+    python3 -m pyperf compare_to \
+        results/pyflate_baseline.json results/pyflate_opt1.json
+    => 1.07x faster
+
+    Absolute saving : ~70 ms per decompression
+    Relative saving : 6.3%
+
+Harness validation: the unmodified fork measured 1.12 sec +- 0.01 sec
+against the baseline's 1.11 sec +- 0.01 sec, a 0.9% difference inside
+the run-to-run noise, so no systematic bias is present.
+
+
+Correctness
+-----------
+
+bench_pyflake verifies the decompressed output against a hardcoded MD5
+digest and raises on mismatch, so a completed run is itself the
+correctness proof. The run completed and reported a timing rather than
+raising "MD5 checksum mismatch".
+
+Additionally verified on the development machine before measurement:
+
+    bench_pyflake(1, 'bm_pyflate_opt/data/interpreter.tar.bz2')
+    => md5 gate passed
+
+
+Note on estimating from cProfile
+--------------------------------
+
+_mask represented 0.128 s / 2.154 s = 5.9% of instrumented self time,
+and the realized saving was 6.3% of wall time. The agreement is closer
+than expected: cProfile inflates per-call bookkeeping, which should
+exaggerate the apparent cost of a function whose cost IS the call, so a
+smaller realized gain was predicted. The instrumented share happened to
+be a good proxy here, but that should not be assumed in general.
