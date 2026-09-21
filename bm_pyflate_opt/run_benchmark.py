@@ -453,14 +453,20 @@ def decode_huffman_block(b, out):
     i = 0
     end = len(nt)
     limit = end - 4
+    append = out.append
+    literal_start = 0
     # Pointless/irritating run-length encoding step
     while i < end:
         if i < limit and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
-            out.append(nt[i:i + 1] * (nt[i + 4] + 4))
+            if literal_start != i:
+                append(nt[literal_start:i])
+            append(nt[i:i + 1] * (nt[i + 4] + 4))
             i += 5
+            literal_start = i
         else:
-            out.append(nt[i:i + 1])
             i += 1
+    if literal_start != end:
+        append(nt[literal_start:end])
 
 # Sixteen bits of magic have been removed by the time we start decoding
 
