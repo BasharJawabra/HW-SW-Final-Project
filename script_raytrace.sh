@@ -194,13 +194,6 @@ stage_flamecmp() {
     # optimizations. The baseline is regenerated here for that reason.
     local loops=3 freq=299
 
-    # See stage_flame for why both of these are needed:
-    # collapse_interpreter.py fixes the height caused by the
-    # interpreter's repeating call cycle, --minwidth fixes the residual
-    # box count and file size. Both sides get identical treatment, which
-    # matters because difffolded.pl matches stacks by name.
-    local minwidth=1
-
     local variant
     for variant in "$BASE_DIR" "$OPT_DIR"; do
         echo "--- profiling $variant ---"
@@ -214,16 +207,43 @@ stage_flamecmp() {
             > "/tmp/${variant}.folded"
     done
 
+    # collapse_interpreter.py (see stage_flame) fixes the height. What
+    # remains is the rendering threshold, and it has to be expressed in
+    # ABSOLUTE time rather than as a percentage.
+    #
+    # flamegraph.pl's --minwidth is a percentage of the run's OWN total.
+    # The optimized run is shorter, so the same percentage is a smaller
+    # absolute threshold on that side and admits thinner stacks: the two
+    # graphs would then differ in shape because of the rendering
+    # setting rather than because of the optimizations, which is exactly
+    # what this stage otherwise takes care to avoid. Measured with a
+    # flat 1%: baseline 6.706 s rendered 40 rows, optimized 3.799 s
+    # rendered 73.
+    #
+    # So 1% of the BASELINE is the common threshold, and the optimized
+    # percentage is scaled up by the ratio of the totals to land on the
+    # same absolute number of nanoseconds.
+    local base_total opt_total base_mw opt_mw
+    base_total=$(awk '{s+=$NF} END {print s}' "/tmp/$BASE_DIR.folded")
+    opt_total=$(awk '{s+=$NF} END {print s}' "/tmp/$OPT_DIR.folded")
+    base_mw=1
+    opt_mw=$(awk -v b="$base_total" -v o="$opt_total" \
+             'BEGIN {printf "%.3f", b/o}')
+    echo "minwidth: baseline ${base_mw}%, optimized ${opt_mw}%" \
+         "(equal absolute time)"
+
+    local sub="interpreter call frames collapsed; frames under 1% of baseline time omitted"
+
     "$fg/flamegraph.pl" \
         --title "raytrace BASELINE (cpu-clock, DWARF unwind)" \
-        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
-        --minwidth "$minwidth" \
+        --subtitle "$sub" \
+        --minwidth "$base_mw" \
         "/tmp/$BASE_DIR.folded" > "$RESULTS/raytrace_baseline_flame.svg"
 
     "$fg/flamegraph.pl" \
         --title "raytrace OPTIMIZED (cpu-clock, DWARF unwind)" \
-        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
-        --minwidth "$minwidth" \
+        --subtitle "$sub" \
+        --minwidth "$opt_mw" \
         "/tmp/$OPT_DIR.folded" > "$RESULTS/raytrace_optimized_flame.svg"
 
     # Sampling is time-based at a fixed frequency, so sample counts are
@@ -232,8 +252,8 @@ stage_flamecmp() {
     "$fg/difffolded.pl" "/tmp/$BASE_DIR.folded" "/tmp/$OPT_DIR.folded" \
         | "$fg/flamegraph.pl" \
             --title "raytrace: optimized vs baseline (blue = time removed)" \
-            --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
-            --minwidth "$minwidth" \
+            --subtitle "$sub" \
+            --minwidth "$base_mw" \
             --negate \
         > "$RESULTS/raytrace_diff_flame.svg"
 
