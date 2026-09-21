@@ -423,7 +423,8 @@ are the same operation.
 
     -  while i < len(nearly_there):
     -      if i < len(nearly_there) - 4 and ...
-    -          out.append(nearly_there[i:i+1] * (ord(nearly_there[i+4:i+5]) + 4))
+    -          out.append(nearly_there[i:i+1]
+    -                     * (ord(nearly_there[i+4:i+5]) + 4))
     +  end = len(nt)
     +  limit = end - 4
     +  while i < end:
