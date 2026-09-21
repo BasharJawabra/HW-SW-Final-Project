@@ -1,0 +1,108 @@
+Raytrace Optimization 1: Hoist Loop-Invariant Shadow Ray
+========================================================
+
+Date   : 2026-09-21
+Commit : ed85843
+File   : bm_raytrace_opt/run_benchmark.py
+Target : Scene._lightIsVisible (line 283 of the original source)
+
+
+The change
+----------
+
+Before:
+
+    def _lightIsVisible(self, l, p):
+        for (o, s) in self.objects:
+            t = o.intersectionTime(Ray(p, l - p))
+            if t is not None and t > EPSILON:
+                return False
+        return True
+
+After:
+
+    def _lightIsVisible(self, l, p):
+        shadowRay = Ray(p, l - p)
+        for (o, s) in self.objects:
+            t = o.intersectionTime(shadowRay)
+            if t is not None and t > EPSILON:
+                return False
+        return True
+
+
+Rationale
+---------
+
+Ray(p, l - p) is loop-invariant: it depends only on the light position l
+and the surface point p, neither of which changes across iterations of
+the loop over scene objects. The original code therefore rebuilt an
+identical Ray for every object in the scene.
+
+The construction is not cheap. Ray.__init__ normalizes its direction
+vector, so each redundant construction costs:
+
+    Point.__sub__      (l - p)
+    Vector.normalized
+      -> Vector.magnitude
+        -> Vector.dot
+          -> math.sqrt
+      -> Vector.scale   (allocates another Vector)
+
+Sharing one Ray across iterations is safe because neither intersection
+routine mutates it: Sphere.intersectionTime reads only ray.point and
+ray.vector, and Halfspace.intersectionTime reads only ray.vector.
+
+
+Measurement
+-----------
+
+Identical run configuration for both (-p 10 -w 1 -n 5):
+
+    baseline (bm_raytrace)      : 799 ms +- 4 ms
+    optimized (bm_raytrace_opt) : 622 ms +- 5 ms
+
+    python3 -m pyperf compare_to \
+        results/raytrace_baseline.json results/raytrace_opt1.json
+    => 1.29x faster
+
+    Absolute saving : 177 ms per render
+    Relative saving : 22.2%
+
+This single change already exceeds the project's >=7% requirement for
+this benchmark.
+
+Harness validation: before applying any optimization, the unmodified
+copy in bm_raytrace_opt was measured at 802 ms +- 4 ms against the
+baseline's 799 ms +- 4 ms, a 0.4% difference that is within the 12 ms
+(3 sigma) noise band established in results/raytrace_baseline.txt.
+The harness therefore introduces no systematic bias, and the 177 ms
+improvement is attributable to the code change.
+
+pyperf emitted its standard stability warning ("Not enough samples to
+get a stable result (95% certainly of less than 1% variation)"). That
+caveat concerns resolving sub-1% differences and does not affect a 22%
+result.
+
+
+Correctness
+-----------
+
+One frame rendered from each variant at 100x100 and compared byte for
+byte:
+
+    f3c700588a9b6320fb1e46027142f205  /tmp/bm_raytrace.ppm
+    f3c700588a9b6320fb1e46027142f205  /tmp/bm_raytrace_opt.ppm
+
+Identical. The transformation is arithmetically exact rather than an
+approximation, so no tolerance is required.
+
+
+Why the gain exceeded the initial estimate
+------------------------------------------
+
+The predicted range was 10-18%, reasoning that the early "return False"
+for shadowed points means many calls exit after a single iteration and
+never pay the full redundancy. The realized 22.2% indicates the shadow
+test more often runs to completion (the point is lit, so all objects
+must be checked), which is consistent with a scene where most visible
+surface points are illuminated by at least one of the two lights.
