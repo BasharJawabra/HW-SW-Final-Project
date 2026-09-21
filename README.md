@@ -198,11 +198,12 @@ normalized, so the blue area is real time deleted. Some red is expected — the
 length-indexed Huffman decode adds dictionary work even as it removes the table
 scan.
 
-Note that the flame graphs are collected under `python3-dbg` and their ratios
-are **not** the benchmark speedups: the debug allocator inflates the value of
-optimizations that work by not allocating, which makes raytrace look 1.79x
-there against 1.60x in reality. `results/optimization_summary.txt` explains
-this. Quote the `pyperf` numbers; treat the graphs as qualitative.
+The graph ratios now agree with the benchmark. perf reports 1.59x for both
+against `pyperf`'s 1.60x and 1.61x. That agreement is recent and was earned:
+the earlier DWARF graphs required `python3-dbg`, whose debug allocator was ~12%
+of the profile and inflated optimizations that work by not allocating, making
+raytrace read 1.79x. Profiling the stock interpreter closed the gap and
+confirmed the diagnosis — see `results/optimization_summary.txt`.
 
 Each `*_comparison.txt` records the change, the predicted gain, the measured
 gain, and the correctness evidence — including the cases where the prediction
