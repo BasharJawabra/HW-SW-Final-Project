@@ -191,7 +191,11 @@ def main():
     write_hex("selectors.hex", selectors, 1)
     write_hex("stream.hex", words, 8)
     write_hex("expected.hex", body, 3)
-    write_hex("meta.hex", [eob_symbol, len(body), len(words)], 4)
+    # The fourth entry lets the testbench check final_bit_pos exactly: the
+    # decoder must report the offset immediately after the EOB code, not
+    # after the code its pipeline speculatively fetched behind it.
+    write_hex("meta.hex",
+              [eob_symbol, len(body), len(words), len(bits)], 4)
 
     print("groups            : %d" % NUM_GROUPS)
     print("alphabet          : %d symbols (eob = %d)" % (alphabet, eob_symbol))
