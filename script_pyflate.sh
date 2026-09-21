@@ -116,9 +116,38 @@ stage_flame() {
         -- python3-dbg "$REPO/profile_pyflate.py" \
               --variant "$BASE_DIR" --loops 2
 
+    # Two separate things make a DWARF-unwound CPython flame graph
+    # unreadable, and they need different fixes.
+    #
+    # HEIGHT, and the box count that follows from it. Reaching one Python
+    # call costs a cycle of seven C frames (_PyEval_Vector,
+    # _PyEval_EvalFrame, _PyEval_EvalFrameDefault, call_function,
+    # PyObject_Vectorcall, _PyObject_VectorcallTstate,
+    # _PyFunction_Vectorcall) and that cycle repeats once per level of
+    # Python call depth. Measured on the previous graph: _PyEval_Vector
+    # appeared 373 times and the image was 138 rows tall.
+    #
+    # Note that stackcollapse-recursive.pl does NOT help here. It merges
+    # only ADJACENT duplicate frames, and this is a cycle of seven
+    # distinct names with no adjacent duplicates, so it collapses
+    # nothing. tools/collapse_interpreter.py folds each run of plumbing
+    # frames into one [python call] frame instead, which also merges
+    # identical leaves that were previously scattered across hundreds of
+    # spine depths. Sample counts are preserved exactly.
+    #
+    # WIDTH. Even after that, sub-1% frames remain, and at 5,536 boxes
+    # 96% of them were narrower than 1%. A box that thin cannot hold a
+    # label, and those boxes are most of the 1.0 MB file. --minwidth
+    # drops them.
+    local minwidth=1
+
     perf script -i /tmp/pyflate_dwarf.data > /tmp/pyflate.perf
-    "$fg/stackcollapse-perf.pl" /tmp/pyflate.perf > /tmp/pyflate.folded
-    "$fg/flamegraph.pl" --title "pyflate baseline (cpu-clock, DWARF unwind)" \
+    "$fg/stackcollapse-perf.pl" /tmp/pyflate.perf \
+        | "$REPO/tools/collapse_interpreter.py" > /tmp/pyflate.folded
+    "$fg/flamegraph.pl" \
+        --title "pyflate baseline (cpu-clock, DWARF unwind)" \
+        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         /tmp/pyflate.folded > "$RESULTS/pyflate_baseline_flame.svg"
 
     echo "wrote $RESULTS/pyflate_baseline_flame.svg"
@@ -146,6 +175,13 @@ stage_flamecmp() {
     # rather than reusing whatever is already on disk.
     local loops=2 freq=299
 
+    # See stage_flame for why both of these are needed:
+    # collapse_interpreter.py fixes the height caused by the
+    # interpreter's repeating call cycle, --minwidth fixes the residual
+    # box count and file size. Both sides get identical treatment, which
+    # matters because difffolded.pl matches stacks by name.
+    local minwidth=1
+
     local variant
     for variant in "$BASE_DIR" "$OPT_DIR"; do
         echo "--- profiling $variant ---"
@@ -155,15 +191,20 @@ stage_flamecmp() {
                   --variant "$variant" --loops "$loops"
         perf script -i "/tmp/${variant}.data" > "/tmp/${variant}.perf"
         "$fg/stackcollapse-perf.pl" "/tmp/${variant}.perf" \
+            | "$REPO/tools/collapse_interpreter.py" \
             > "/tmp/${variant}.folded"
     done
 
     "$fg/flamegraph.pl" \
         --title "pyflate BASELINE (cpu-clock, DWARF unwind)" \
+        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         "/tmp/$BASE_DIR.folded" > "$RESULTS/pyflate_baseline_flame.svg"
 
     "$fg/flamegraph.pl" \
         --title "pyflate OPTIMIZED (cpu-clock, DWARF unwind)" \
+        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         "/tmp/$OPT_DIR.folded" > "$RESULTS/pyflate_optimized_flame.svg"
 
     # Differential flame graph. Sampling is time-based at a fixed
@@ -173,6 +214,8 @@ stage_flamecmp() {
     "$fg/difffolded.pl" "/tmp/$BASE_DIR.folded" "/tmp/$OPT_DIR.folded" \
         | "$fg/flamegraph.pl" \
             --title "pyflate: optimized vs baseline (blue = time removed)" \
+            --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+            --minwidth "$minwidth" \
             --negate \
         > "$RESULTS/pyflate_diff_flame.svg"
 
