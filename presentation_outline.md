@@ -54,23 +54,39 @@ This slide earns credibility. Don't skip it.
    *zero samples*. Everything runs on the `cpu-clock` software event, which
    measures elapsed **time**, not retired cycles — no IPC, no cache misses.
 2. **CPython 3.10 has no `perf` trampoline support** (added in 3.12). `perf`
-   literally cannot see a Python function. Our flame graph has 577 frames and
-   not one is a pyflate function.
+   literally cannot see a Python function — not one frame in our flame graphs
+   is a pyflate function; they are all interpreter C symbols.
 
 > The honest framing: this is why the project uses *two* profilers. cProfile
 > gives Python-level attribution; perf gives C-level "what kind of work".
 > Neither alone would be convincing. They agree, and that agreement is the
 > evidence.
 
-**Slide 5 (optional, only if time is comfortable): the DWARF detour**
+**Slide 5 (strong slide — present it if you have the time): the unwinder, and
+a prediction that was tested**
 
-Frame-pointer unwinding on `python3-dbg` produced return addresses like
-`0xfdfdfdfdfd000053`. Those aren't addresses — a debug build paints freed
-memory with `0xFD`/`0xDD`, and the unwinder was reporting fill bytes as stack
-frames. Switched to DWARF unwinding.
+Three stages, and the third is the point.
 
-> Good slide to have ready as a backup answer rather than to present, unless
-> you're running early.
+1. Frame-pointer unwinding on `python3-dbg` produced return addresses like
+   `0xfdfdfdfdfd000053`. Those aren't addresses — a debug build paints memory
+   with `0xFD`/`0xDD` and the unwinder was reporting fill bytes as frames. So
+   we switched to DWARF, which needs the debug build's symbols.
+2. But the debug allocator was ~12% of that profile, and perf then disagreed
+   with the benchmark: **1.79x for raytrace against pyperf's 1.60x**. We
+   diagnosed the cause from the profile itself — the inflated rows are
+   `_PyMem_DebugCheckAddress`, `read_size_t`, `write_size_t`, and two of
+   raytrace's three optimizations win precisely by *not* allocating.
+3. That diagnosis makes a prediction: profile the **stock** interpreter and
+   the gap should close. Frame pointers make that possible because they need
+   no debug info, and the stock build doesn't paint memory. Result: perf
+   reports **1.59x for both benchmarks** against 1.60x and 1.61x.
+
+> Why this slide is worth the time: it shows a measurement disagreement that
+> was explained and then *tested*, not explained away. Be ready for the
+> follow-up — the cost is stack depth, since Ubuntu builds `python3` with
+> `-fomit-frame-pointer`, so the final graphs rank self time reliably but show
+> little call hierarchy. The deep-structure evidence lives in the `perf
+> report` rankings and cProfile instead.
 
 ---
 
