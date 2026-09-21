@@ -150,8 +150,23 @@ C stack. `cProfile` supplies the Python-level attribution instead, in
 `results/<name>_cprofile_baseline.txt`, and the two are cross-checked against
 each other in `results/<name>_perf_baseline.txt`.
 
-They are also **very deep** (~5,000 frames), because every Python call becomes
-several C frames and `rayColour` recurses.
+They are **post-processed to be readable**, by `tools/collapse_interpreter.py`.
+Reaching one Python call costs a cycle of seven C frames — `_PyEval_Vector`,
+`_PyEval_EvalFrame`, `_PyEval_EvalFrameDefault`, `call_function`,
+`PyObject_Vectorcall`, `_PyObject_VectorcallTstate`, `_PyFunction_Vectorcall` —
+repeated once per level of Python call depth. Unprocessed, the raytrace
+baseline was 127 rows tall with `_PyEval_Vector` appearing 809 times, and
+9,525 boxes of which 92% were too narrow to label. The tool folds each run of
+that plumbing into a single `[python call]` frame, which also merges identical
+leaves that were previously scattered across hundreds of spine depths, so
+`frame_dealloc` and the `pymalloc` functions become single wide labelled boxes.
+Sample counts are preserved exactly; `--minwidth 1` then drops the residual
+unlabelable slivers.
+
+`stackcollapse-recursive.pl` from the FlameGraph toolkit does not help here: it
+merges only *adjacent* duplicate frames, and this is a cycle of seven distinct
+names. Per-symbol self time is unaffected and remains in the `perf report`
+output saved in `results/<name>_perf_baseline.txt`.
 
 That C-level view is not merely a fallback: it is the *only* view that can show
 frame-allocation cost — `call_function`, `frame_dealloc`,
