@@ -5,6 +5,19 @@ Date  : 2026-09-21
 Tool  : perf 5.15.209, FlameGraph (brendangregg), python3-dbg 3.10.12
 Graph : results/pyflate_baseline_flame.svg
 
+NOTE ON THE FINAL CONFIGURATION
+
+    This document records the baseline investigation as it happened,
+    using DWARF unwinding against python3-dbg. The committed flame
+    graphs were later regenerated with frame-pointer unwinding (-g)
+    against the STOCK python3, so the collection details below describe
+    the debug-build profile rather than the current SVGs.
+
+    The reason for the change: the debug allocator is ~12% of the debug
+    profile, which held the measured speedup to 1.54x against pyperf's
+    1.61x. Profiling the stock interpreter brought perf to 1.59x.
+    Details in results/optimization_summary.txt.
+
 
 Collection
 ----------

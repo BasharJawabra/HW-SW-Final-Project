@@ -4,6 +4,26 @@ Raytrace Baseline Profile (perf)
 Date : 2026-09-21
 Tool : perf 5.15.209, FlameGraph (brendangregg), python3-dbg 3.10.12
 
+NOTE ON THE FINAL CONFIGURATION
+
+    This document records the baseline investigation as it happened,
+    using DWARF unwinding against python3-dbg. The committed flame
+    graphs were later regenerated with frame-pointer unwinding (-g)
+    against the STOCK python3, so the numbers below describe the
+    debug-build profile rather than the current SVGs.
+
+    The reason for the change: the debug allocator is ~12% of the debug
+    profile and inflated the measured speedup to 1.79x against pyperf's
+    1.60x. Profiling the stock interpreter brought perf to 1.59x and
+    closed the gap, confirming the diagnosis. Details in
+    results/optimization_summary.txt.
+
+    Section 1b below is still the reason -g is paired with the stock
+    build and never with python3-dbg: on the debug build the
+    frame-pointer unwinder reports allocator fill bytes as return
+    addresses. What the stock build costs instead is stack depth, since
+    Ubuntu compiles it with -fomit-frame-pointer.
+
 
 1. Environment constraints discovered while setting up profiling
 ----------------------------------------------------------------
