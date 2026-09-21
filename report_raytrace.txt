@@ -176,11 +176,26 @@ math.sqrt is the only transcendental work in the entire frame.
 2.5 perf profile and flame graph
 --------------------------------
 
-Collected with cpu-clock (the QEMU guest exposes no PMU, so the
-hardware cycles event yields zero samples) and DWARF unwinding (the
-frame-pointer unwinder on python3-dbg reports debug-allocator fill
-bytes 0xFD and 0xDD as return addresses, producing a meaningless
-graph). Full detail in results/raytrace_perf_baseline.txt.
+Collected with cpu-clock, because the QEMU guest exposes no PMU and the
+hardware cycles event yields zero samples. These figures therefore
+measure elapsed time, not retired cycles.
+
+The ranking below comes from DWARF unwinding against python3-dbg, which
+is what the optimization decisions were made from. DWARF was necessary
+because the frame-pointer unwinder on the debug build reports
+debug-allocator fill bytes 0xFD and 0xDD as return addresses, producing
+a meaningless graph.
+
+The committed flame graphs were later regenerated differently, with
+frame-pointer unwinding against the STOCK python3, because the debug
+allocator was ~12% of the debug profile and inflated the measured
+speedup to 1.79x against pyperf's 1.60x. On the stock interpreter perf
+reports 1.59x, which closed the gap and confirmed that diagnosis. The
+trade is stack depth: Ubuntu compiles python3 with
+-fomit-frame-pointer, so those graphs rank self time reliably but show
+little call hierarchy. Both configurations are documented in
+results/raytrace_perf_baseline.txt and
+results/optimization_summary.txt.
 
     28.55%  28.54%  _PyEval_EvalFrameDefault
      3.45%   3.44%  call_function
