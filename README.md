@@ -131,18 +131,7 @@ results/pyflate_accel_analysis.txt        speedup estimate for the hardware
 results/huffman_sim.txt                   accelerator verification
 ```
 
-Flame graphs, in two sets that answer different questions.
-
-**Python-level** (`py-spy`) — which *benchmark* function is hot. Start here.
-
-```
-results/<name>_baseline_python_flame.svg
-results/<name>_optimized_python_flame.svg
-```
-
-Regenerate with `./script_<name>.sh pyflame`.
-
-**C-level** (`perf` + DWARF) — what the *interpreter* is doing.
+Flame graphs, three per benchmark, all from `perf`:
 
 ```
 results/<name>_baseline_flame.svg         before
@@ -150,19 +139,26 @@ results/<name>_optimized_flame.svg        after
 results/<name>_diff_flame.svg             differential
 ```
 
-Both sets exist deliberately. CPython 3.10 predates the `perf` trampoline
-support added in 3.12, so `perf` cannot name a Python function: its graphs
-show the interpreter's C stack, which is why they run to 5,118 frames while
-the py-spy graphs are 32–78. But the C-level view is the *only* one that can
-show frame-allocation cost — `call_function`, `frame_dealloc`,
+These are collected with `perf record -e cpu-clock --call-graph dwarf` and
+rendered with Brendan Gregg's `flamegraph.pl`. Two things about them need
+stating up front, because both look like defects otherwise.
+
+They show **C-level interpreter symbols, not Python function names.** CPython
+3.10 predates the `perf` trampoline support added in 3.12, so `perf` cannot
+attribute a sample to a Python function — it sees only the interpreter's own
+C stack. `cProfile` supplies the Python-level attribution instead, in
+`results/<name>_cprofile_baseline.txt`, and the two are cross-checked against
+each other in `results/<name>_perf_baseline.txt`.
+
+They are also **very deep** (~5,000 frames), because every Python call becomes
+several C frames and `rayColour` recurses.
+
+That C-level view is not merely a fallback: it is the *only* view that can show
+frame-allocation cost — `call_function`, `frame_dealloc`,
 `_PyEval_MakeFrameVector` — and that ~10.9% is what drove every raytrace
 optimization toward eliminating calls rather than improving arithmetic. A
 Python-level profiler cannot show it, because frame allocation is not a Python
 function.
-
-The py-spy pair also makes two optimizations visible directly: `mustBeVector`
-and `_mask` are present in the baseline graphs and **absent** from the
-optimized ones.
 
 Regenerate with `./script_<name>.sh flamecmp`, which collects both profiles
 with identical parameters — a differential graph is only meaningful if the two
