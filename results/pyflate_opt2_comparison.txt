@@ -1,0 +1,109 @@
+Pyflate Optimization 2: Rewrite move_to_front
+=============================================
+
+Date   : 2026-09-21
+Commit : dc25f9c
+File   : bm_pyflate_opt/run_benchmark.py
+Target : move_to_front (line 289)
+
+
+The change
+----------
+
+Before:
+
+    def move_to_front(l, c):
+        l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
+
+After:
+
+    def move_to_front(l, c):
+        l.insert(0, l.pop(c))
+
+
+Rationale
+---------
+
+The move-to-front stage of bzip2 decoding rotates one element of a list
+to the front, preserving the order of the rest. The original expressed
+this as three slices concatenated into a fourth list, then assigned back
+over the original with slice assignment.
+
+Per call that allocates four list objects and copies every element,
+regardless of the index involved. cProfile measured 92,803 calls and
+0.210 s of self time with no children, i.e. all of it in list
+construction. The favourites list in decode_huffman_block holds one
+entry per distinct byte value present in the block, up to 256.
+
+l.insert(0, l.pop(c)) performs the same rotation using two C-level list
+operations on the internal pointer array, with no intermediate objects.
+Both forms mutate in place, which the call sites rely on.
+
+
+Equivalence
+-----------
+
+Verified exhaustively rather than by inspection. For every list length
+from 1 to 11 and every valid index within it, the old and new
+implementations were applied to identical lists and the results
+compared:
+
+    identical for every (length, index) pair up to length 11
+
+This includes the c == 0 case, where the original is semantically a
+no-op yet still rebuilds the entire list.
+
+Both call sites benefit:
+    line 368  compute_selectors_list, on the table-selector MTF list
+    line 443  decode_huffman_block, on the favourites list
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    opt1 (mask inlined) : 1.04 sec +- 0.01 sec
+    opt2 (this change)  : 865 ms +- 7 ms
+
+Isolated contribution:
+
+    python3 -m pyperf compare_to \
+        results/pyflate_opt1.json results/pyflate_opt2.json
+    => 1.21x faster, 16.8% reduction
+
+Cumulative against the original baseline:
+
+    python3 -m pyperf compare_to \
+        results/pyflate_baseline.json results/pyflate_opt2.json
+    => 1.11 sec -> 865 ms: 1.29x faster
+    => ~245 ms saved, 22.1% reduction
+
+
+Correctness
+-----------
+
+The run completed and reported a timing, which means bench_pyflake's
+internal MD5 assertion passed. Independently confirmed on the
+development machine before measurement.
+
+
+Estimate versus result
+----------------------
+
+Predicted 4-8%; measured 16.8%. The prediction counted operations
+rather than allocations. The dominant cost was not the element copying
+but the creation and destruction of roughly 371,000 short-lived list
+objects (4 per call over 92,803 calls), which loads the allocator and
+the garbage collector. Replacing them with in-place C-level operations
+removes that pressure entirely.
+
+
+Status against project requirements
+-----------------------------------
+
+With this change both selected benchmarks exceed the required 7%
+improvement:
+
+    raytrace : 799 ms -> 497 ms   1.61x faster, 37.8% reduction
+    pyflate  : 1.11 s -> 865 ms   1.29x faster, 22.1% reduction
