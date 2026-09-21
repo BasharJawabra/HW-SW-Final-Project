@@ -263,10 +263,23 @@ stage_pyflame() {
         # No --subprocesses: the driver runs in a single process, and
         # py-spy fails with "No child process" trying to reap a child
         # that has already exited.
+        #
+        # The trailing `|| true` is load bearing. py-spy writes its
+        # output, reports the sample count, and THEN fails trying to
+        # reap a child that has already exited:
+        #     Error: No child process (os error 10)
+        # Under `set -e` a successful profile would therefore abort the
+        # script. The exit status is ignored and the artifact is checked
+        # instead, which is the thing actually being relied on.
         py-spy record --format raw --rate "$rate" \
             --output "/tmp/${variant}.pyfolded" \
             -- python3 "$REPO/profile_pyflate.py" \
-                  --variant "$variant" --loops "$loops"
+                  --variant "$variant" --loops "$loops" || true
+
+        if [ ! -s "/tmp/${variant}.pyfolded" ]; then
+            echo "py-spy wrote no samples for $variant" >&2
+            return 1
+        fi
 
         # py-spy roots every stack at 'process <pid>:"<full command>"'.
         # That frame is a whole command line wide, so it squashes the
