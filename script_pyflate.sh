@@ -10,6 +10,7 @@
 #   ./script_pyflate.sh compare    statistical comparison of the two
 #   ./script_pyflate.sh cprofile   per-function profile of both variants
 #   ./script_pyflate.sh flame      perf record + flame graph
+#   ./script_pyflate.sh flamecmp   baseline vs optimized + diff flame graph
 #   ./script_pyflate.sh hw         compile and simulate the accelerator
 #   ./script_pyflate.sh all        everything except setup
 #
@@ -128,6 +129,67 @@ stage_flame() {
 }
 
 
+stage_flamecmp() {
+    say "flame graph comparison: baseline vs optimized"
+
+    local fg
+    fg="$(dirname "$(find "$HOME" -name stackcollapse-perf.pl 2>/dev/null \
+          | head -1)")"
+    if [ ! -x "$fg/stackcollapse-perf.pl" ]; then
+        echo "FlameGraph not found; run '$0 setup' first" >&2
+        return 1
+    fi
+
+    # Both profiles MUST be collected with identical parameters, otherwise
+    # the difference between them reflects the collection settings rather
+    # than the optimizations. The baseline is therefore regenerated here
+    # rather than reusing whatever is already on disk.
+    local loops=2 freq=299
+
+    local variant
+    for variant in "$BASE_DIR" "$OPT_DIR"; do
+        echo "--- profiling $variant ---"
+        perf record -e cpu-clock -F "$freq" --call-graph dwarf \
+            -o "/tmp/${variant}.data" \
+            -- python3-dbg "$REPO/profile_pyflate.py" \
+                  --variant "$variant" --loops "$loops"
+        perf script -i "/tmp/${variant}.data" > "/tmp/${variant}.perf"
+        "$fg/stackcollapse-perf.pl" "/tmp/${variant}.perf" \
+            > "/tmp/${variant}.folded"
+    done
+
+    "$fg/flamegraph.pl" \
+        --title "pyflate BASELINE (cpu-clock, DWARF unwind)" \
+        "/tmp/$BASE_DIR.folded" > "$RESULTS/pyflate_baseline_flame.svg"
+
+    "$fg/flamegraph.pl" \
+        --title "pyflate OPTIMIZED (cpu-clock, DWARF unwind)" \
+        "/tmp/$OPT_DIR.folded" > "$RESULTS/pyflate_optimized_flame.svg"
+
+    # Differential flame graph. Sampling is time-based at a fixed
+    # frequency, so sample counts are proportional to elapsed time and
+    # the raw (un-normalized) diff shows where time was actually
+    # removed. Red means slower, blue means faster.
+    "$fg/difffolded.pl" "/tmp/$BASE_DIR.folded" "/tmp/$OPT_DIR.folded" \
+        | "$fg/flamegraph.pl" \
+            --title "pyflate: optimized vs baseline (blue = time removed)" \
+            --negate \
+        > "$RESULTS/pyflate_diff_flame.svg"
+
+    echo
+    echo "wrote:"
+    ls -la "$RESULTS"/pyflate_baseline_flame.svg \
+           "$RESULTS"/pyflate_optimized_flame.svg \
+           "$RESULTS"/pyflate_diff_flame.svg
+
+    say "sample counts (proportional to elapsed time)"
+    printf 'baseline  : %s samples\n' \
+        "$(awk '{s+=$NF} END {print s}' "/tmp/$BASE_DIR.folded")"
+    printf 'optimized : %s samples\n' \
+        "$(awk '{s+=$NF} END {print s}' "/tmp/$OPT_DIR.folded")"
+}
+
+
 stage_hw() {
     say "hardware: regenerate vectors from the Python model"
     python3 "$REPO/hw/gen_test_vectors.py"
@@ -156,6 +218,7 @@ main() {
         compare)   stage_compare ;;
         cprofile)  stage_cprofile ;;
         flame)     stage_flame ;;
+        flamecmp)  stage_flamecmp ;;
         hw)        stage_hw ;;
         all)
             stage_baseline
@@ -163,6 +226,7 @@ main() {
             stage_compare
             stage_cprofile
             stage_flame
+            stage_flamecmp
             stage_hw
             ;;
         default)

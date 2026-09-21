@@ -11,6 +11,7 @@
 #   ./script_raytrace.sh verify     byte-for-byte output equivalence
 #   ./script_raytrace.sh cprofile   per-function profile of both variants
 #   ./script_raytrace.sh flame      perf record + flame graph
+#   ./script_raytrace.sh flamecmp   baseline vs optimized + diff flame graph
 #   ./script_raytrace.sh all        everything except setup
 #
 # With no argument it runs: baseline, optimized, compare, verify.
@@ -148,6 +149,65 @@ stage_flame() {
 }
 
 
+stage_flamecmp() {
+    say "flame graph comparison: baseline vs optimized"
+
+    local fg
+    fg="$(dirname "$(find "$HOME" -name stackcollapse-perf.pl 2>/dev/null \
+          | head -1)")"
+    if [ ! -x "$fg/stackcollapse-perf.pl" ]; then
+        echo "FlameGraph not found; run '$0 setup' first" >&2
+        return 1
+    fi
+
+    # Both profiles MUST use identical collection parameters, or the
+    # difference between them reflects the settings rather than the
+    # optimizations. The baseline is regenerated here for that reason.
+    local loops=3 freq=299
+
+    local variant
+    for variant in "$BASE_DIR" "$OPT_DIR"; do
+        echo "--- profiling $variant ---"
+        perf record -e cpu-clock -F "$freq" --call-graph dwarf \
+            -o "/tmp/${variant}.data" \
+            -- python3-dbg "$REPO/profile_raytrace.py" \
+                  --variant "$variant" --loops "$loops"
+        perf script -i "/tmp/${variant}.data" > "/tmp/${variant}.perf"
+        "$fg/stackcollapse-perf.pl" "/tmp/${variant}.perf" \
+            > "/tmp/${variant}.folded"
+    done
+
+    "$fg/flamegraph.pl" \
+        --title "raytrace BASELINE (cpu-clock, DWARF unwind)" \
+        "/tmp/$BASE_DIR.folded" > "$RESULTS/raytrace_baseline_flame.svg"
+
+    "$fg/flamegraph.pl" \
+        --title "raytrace OPTIMIZED (cpu-clock, DWARF unwind)" \
+        "/tmp/$OPT_DIR.folded" > "$RESULTS/raytrace_optimized_flame.svg"
+
+    # Sampling is time-based at a fixed frequency, so sample counts are
+    # proportional to elapsed time and the raw diff shows where time was
+    # actually removed rather than merely how the shape shifted.
+    "$fg/difffolded.pl" "/tmp/$BASE_DIR.folded" "/tmp/$OPT_DIR.folded" \
+        | "$fg/flamegraph.pl" \
+            --title "raytrace: optimized vs baseline (blue = time removed)" \
+            --negate \
+        > "$RESULTS/raytrace_diff_flame.svg"
+
+    echo
+    echo "wrote:"
+    ls -la "$RESULTS"/raytrace_baseline_flame.svg \
+           "$RESULTS"/raytrace_optimized_flame.svg \
+           "$RESULTS"/raytrace_diff_flame.svg
+
+    say "sample counts (proportional to elapsed time)"
+    printf 'baseline  : %s samples\n' \
+        "$(awk '{s+=$NF} END {print s}' "/tmp/$BASE_DIR.folded")"
+    printf 'optimized : %s samples\n' \
+        "$(awk '{s+=$NF} END {print s}' "/tmp/$OPT_DIR.folded")"
+}
+
+
 main() {
     case "${1:-default}" in
         setup)     stage_setup ;;
@@ -157,6 +217,7 @@ main() {
         verify)    stage_verify ;;
         cprofile)  stage_cprofile ;;
         flame)     stage_flame ;;
+        flamecmp)  stage_flamecmp ;;
         all)
             stage_baseline
             stage_optimized
@@ -164,6 +225,7 @@ main() {
             stage_verify
             stage_cprofile
             stage_flame
+            stage_flamecmp
             ;;
         default)
             stage_baseline
