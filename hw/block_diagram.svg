@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 1990" width="1140" height="1990" font-family="Helvetica, Arial, sans-serif">
+
+  <style>
+    .bg     { fill: #ffffff; }
+    .sw     { fill: #eef3fb; stroke: #4a6fa5; stroke-width: 2; }
+    .hw     { fill: #fdf2e6; stroke: #c07a2b; stroke-width: 2; }
+    .accel  { fill: #eaf6ec; stroke: #3d8b4e; stroke-width: 2.5; }
+    .mem    { fill: #f3eef7; stroke: #7a5ba5; stroke-width: 2; }
+    .sub    { fill: #ffffff; stroke: #9a9a9a; stroke-width: 1.2; }
+    .ttl    { font-size: 21px; font-weight: bold; fill: #1a1a1a; }
+    .box    { font-size: 15px; font-weight: bold; fill: #1a1a1a; }
+    .txt    { font-size: 13px; fill: #333333; }
+    .mono   { font-size: 12.5px; fill: #333333; font-family: Menlo, Consolas, monospace; }
+    .lbl    { font-size: 12px; fill: #555555; font-style: italic; }
+    .hot    { font-size: 13px; fill: #b03030; font-weight: bold; }
+    .wire   { stroke: #444444; stroke-width: 2; fill: none; }
+    .wire2  { stroke: #3d8b4e; stroke-width: 2.5; fill: none; }
+    .dash   { stroke: #888888; stroke-width: 1.6; fill: none; stroke-dasharray: 7 5; }
+  </style>
+
+  <defs>
+    <marker id="a" markerWidth="11" markerHeight="8" refX="10" refY="4" orient="auto">
+      <path d="M0,0 L11,4 L0,8 z" fill="#444444"/>
+    </marker>
+    <marker id="ag" markerWidth="11" markerHeight="8" refX="10" refY="4" orient="auto">
+      <path d="M0,0 L11,4 L0,8 z" fill="#3d8b4e"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1140" height="1990"/>
+
+  <!-- ==================== PANEL 1: SYSTEM ==================== -->
+  <text class="ttl" x="60" y="42">1. System integration</text>
+
+  <rect class="sw" x="70" y="62" width="1000" height="168" rx="8"/>
+  <text class="box" x="90" y="88">HOST CPU  -  CPython 3.10, bm_pyflate_opt</text>
+  <text class="mono" x="110" y="112">bzip2_main()</text>
+  <text class="mono" x="130" y="134">block header parse / compute_tables / selectors</text>
+  <text class="txt"  x="700" y="134">software, once per block</text>
+  <text class="mono" x="130" y="156">decode_huffman_block()</text>
+  <text class="mono" x="150" y="178">find_next_symbol()  x 148,271 per decompression</text>
+  <text class="hot"  x="700" y="178">ACCELERATED</text>
+  <text class="mono" x="150" y="200">move_to_front / bwt_reverse / RLE expansion</text>
+  <text class="txt"  x="700" y="200">stays in software</text>
+
+  <path class="wire" d="M 250,230 L 250,286" marker-end="url(#a)"/>
+  <text class="lbl" x="258" y="262">AXI4-Lite</text>
+
+  <path class="wire" d="M 800,230 L 800,286" marker-end="url(#a)"/>
+  <text class="lbl" x="808" y="262">descriptors</text>
+
+  <rect class="hw" x="90" y="288" width="330" height="200" rx="6"/>
+  <text class="box" x="108" y="312">Register file (AXI4-Lite)</text>
+  <text class="mono" x="108" y="338">0x00  CTRL / start</text>
+  <text class="mono" x="108" y="358">0x04  STATUS busy,done,error</text>
+  <text class="mono" x="108" y="378">0x08  EOB_SYMBOL</text>
+  <text class="mono" x="108" y="398">0x0C  SYMBOL_COUNT</text>
+  <text class="mono" x="108" y="418">0x10  FINAL_BIT_POS</text>
+  <text class="mono" x="108" y="438">0x14  TBL_WRITE  (per length)</text>
+  <text class="mono" x="108" y="458">0x18  SYM_WRITE  (flat table)</text>
+  <text class="mono" x="108" y="478">0x1C  SEL_WRITE  (selectors)</text>
+
+  <rect class="hw" x="620" y="288" width="350" height="104" rx="6"/>
+  <text class="box" x="638" y="312">DMA engine</text>
+  <text class="mono" x="638" y="338">MM2S  compressed block bits  --&gt; 32-bit</text>
+  <text class="mono" x="638" y="360">S2MM  decoded symbol array   &lt;-- 9-bit</text>
+  <text class="lbl"  x="638" y="382">bulk transfer: no per-symbol CPU access</text>
+
+  <path class="wire" d="M 250,488 L 250,528 L 400,528 L 400,566" marker-end="url(#a)"/>
+  <text class="lbl" x="258" y="518">tables, selectors, control</text>
+
+  <path class="wire2" d="M 700,392 L 700,566" marker-end="url(#ag)"/>
+  <text class="lbl" x="596" y="470">AXI4-Stream</text>
+  <text class="lbl" x="596" y="486">32-bit in</text>
+
+  <path class="wire2" d="M 830,566 L 830,392" marker-end="url(#ag)"/>
+  <text class="lbl" x="843" y="470">AXI4-Stream</text>
+  <text class="lbl" x="843" y="486">9-bit out</text>
+
+  <rect class="accel" x="300" y="568" width="540" height="88" rx="8"/>
+  <text class="box" x="322" y="596">huffman_decoder.sv</text>
+  <text class="txt" x="322" y="620">canonical Huffman symbol decode, 1 symbol per cycle</text>
+  <text class="txt" x="322" y="642">measured 1.02 cycles/symbol - see results/huffman_sim.txt</text>
+
+  <rect class="mem" x="90" y="712" width="880" height="72" rx="6"/>
+  <text class="box" x="112" y="740">DDR / system memory</text>
+  <text class="mono" x="112" y="764">compressed block bits --&gt; MM2S          decoded symbol array &lt;-- S2MM</text>
+
+  <path class="wire" d="M 1000,752 L 1032,752 L 1032,344 L 978,344" marker-end="url(#a)"/>
+  <path class="wire" d="M 978,326 L 1016,326 L 1016,734 L 1000,734" marker-end="url(#a)"/>
+
+  <text class="lbl" x="90" y="814">Boundary rationale: header parsing and table construction run once per block, not per symbol, so they stay in software.</text>
+  <text class="lbl" x="90" y="832">Symbols leave by DMA, never through a per-symbol register read - see section 1 of hw/block_diagram.txt.</text>
+
+  <!-- ==================== PANEL 2: INTERNALS ==================== -->
+  <line x1="60" y1="866" x2="1080" y2="866" stroke="#cccccc" stroke-width="1"/>
+  <text class="ttl" x="60" y="906">2. Accelerator internals</text>
+
+  <text class="lbl" x="430" y="940">AXI4-Stream in, 32-bit words</text>
+  <path class="wire" d="M 560,948 L 560,974" marker-end="url(#a)"/>
+
+  <rect class="sub" x="330" y="976" width="460" height="104" rx="6"/>
+  <text class="box" x="350" y="1000">BIT BUFFER - 64-bit, MSB-aligned</text>
+  <text class="txt" x="350" y="1022">matches RBitfield: bzip2 is consumed most-significant-bit first</text>
+  <text class="txt" x="350" y="1043">refill when free space is 32 or more; shift out consume_len bits</text>
+  <text class="mono" x="350" y="1066">s_ready &lt;-- (bit count &lt;= 32)</text>
+
+  <path class="wire" d="M 560,1080 L 560,1128" marker-end="url(#a)"/>
+  <text class="lbl" x="572" y="1110">peek = top 20 bits</text>
+
+  <rect class="sub" x="120" y="1130" width="600" height="198" rx="6"/>
+  <text class="box" x="140" y="1156">STAGE 1 - all 20 code lengths evaluated CONCURRENTLY</text>
+  <text class="mono" x="140" y="1186">for L = 1 .. 20, in parallel:</text>
+  <text class="mono" x="160" y="1210">cand[L]   = peek &gt;&gt; (20 - L)</text>
+  <text class="mono" x="160" y="1232">offset[L] = cand[L] - first_code[L]</text>
+  <text class="mono" x="160" y="1254">hit[L]    = count[L] != 0</text>
+  <text class="mono" x="160" y="1276">         &amp;&amp; cand[L] &gt;= first_code[L]</text>
+  <text class="mono" x="160" y="1298">         &amp;&amp; offset[L] &lt;  count[L]</text>
+  <text class="mono" x="160" y="1320">         &amp;&amp; bits_available &gt;= L</text>
+
+  <rect class="sub" x="790" y="1130" width="270" height="98" rx="6"/>
+  <text class="box" x="808" y="1154">GROUP CONTROL</text>
+  <text class="mono" x="808" y="1178">selector RAM --&gt; cur_table</text>
+  <text class="mono" x="808" y="1198">group_left counts 50</text>
+  <text class="txt"  x="808" y="1219">bzip2 reselects every 50 symbols</text>
+  <path class="wire" d="M 790,1180 L 726,1180" marker-end="url(#a)"/>
+
+  <rect class="sub" x="790" y="1246" width="270" height="96" rx="6"/>
+  <text class="box" x="808" y="1270">PER-LENGTH TABLE RAM</text>
+  <text class="mono" x="808" y="1292">first_code[L], count[L]</text>
+  <text class="mono" x="808" y="1312">base_index[L]</text>
+  <text class="txt"  x="808" y="1332">x 6 Huffman groups</text>
+  <path class="wire" d="M 790,1294 L 726,1294" marker-end="url(#a)"/>
+
+  <path class="wire" d="M 420,1328 L 420,1372" marker-end="url(#a)"/>
+  <text class="lbl" x="432" y="1354">hit[1..20] - at most one set (prefix-free)</text>
+
+  <rect class="sub" x="220" y="1374" width="400" height="78" rx="6"/>
+  <text class="box" x="240" y="1400">SHORTEST-MATCH ARBITER</text>
+  <text class="txt" x="240" y="1422">descending priority scan over hit[]</text>
+  <text class="mono" x="240" y="1444">gives sel_len, sel_hit</text>
+
+  <path class="dash" d="M 220,1412 L 100,1412 L 100,1028 L 324,1028" marker-end="url(#a)"/>
+  <text class="lbl" x="92" y="1240" transform="rotate(-90 92,1240)">consume sel_len bits, advance bit_pos</text>
+
+  <path class="wire" d="M 420,1452 L 420,1490" marker-end="url(#a)"/>
+
+  <rect class="sub" x="220" y="1492" width="400" height="66" rx="6"/>
+  <text class="box" x="240" y="1518">FLAT INDEX</text>
+  <text class="mono" x="240" y="1544">sym_index = base_index[sel_len] + offset[sel_len]</text>
+
+  <line x1="160" y1="1584" x2="680" y2="1584" stroke="#888888" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <text class="lbl" x="686" y="1588">pipeline register</text>
+  <path class="wire" d="M 420,1558 L 420,1610" marker-end="url(#a)"/>
+
+  <rect class="sub" x="220" y="1612" width="400" height="86" rx="6"/>
+  <text class="box" x="240" y="1638">STAGE 2 - SYMBOL RAM</text>
+  <text class="txt" x="240" y="1660">flat table ordered by (length, code)</text>
+  <text class="txt" x="240" y="1682">258 entries x 6 groups</text>
+
+  <path class="wire2" d="M 620,1655 L 890,1655" marker-end="url(#ag)"/>
+  <text class="lbl" x="638" y="1645">m_data, 9-bit symbol, to AXI4-Stream out</text>
+
+  <path class="wire" d="M 420,1698 L 420,1740" marker-end="url(#a)"/>
+
+  <rect class="sub" x="220" y="1742" width="400" height="104" rx="6"/>
+  <text class="box" x="240" y="1768">EOB DETECT / COMPLETION</text>
+  <text class="mono" x="240" y="1792">symbol == eob_symbol ?</text>
+  <text class="mono" x="258" y="1814">yes: done, busy=0, final_bit_pos</text>
+  <text class="mono" x="258" y="1834">no : symbol_count++</text>
+
+  <rect class="accel" x="680" y="1700" width="390" height="184" rx="8"/>
+  <text class="box" x="700" y="1726">Why one cycle is enough</text>
+  <text class="txt" x="700" y="1750">pyflate assigns codes canonically, so</text>
+  <text class="txt" x="700" y="1770">length-L codes are consecutive integers</text>
+  <text class="txt" x="700" y="1790">starting at first_code[L]. Matching is</text>
+  <text class="mono" x="700" y="1814">cand - first_code[L] &lt; count[L]</text>
+  <text class="txt" x="700" y="1838">one subtract and one compare, so no</text>
+  <text class="txt" x="700" y="1858">codes are stored and none are compared.</text>
+  <text class="txt" x="700" y="1878">The software scan searches; this does not.</text>
+
+  <text class="lbl" x="60" y="1912">Critical path: peek, then 20 parallel compares, then the arbiter, then a 64-bit barrel shift.</text>
+  <text class="lbl" x="60" y="1930">The 200 MHz target on a mid-range FPGA is an argument from that path, not a synthesis result:</text>
+  <text class="lbl" x="60" y="1948">nothing here has been synthesized and no timing report exists.</text>
+
+</svg>
