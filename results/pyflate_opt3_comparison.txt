@@ -1,0 +1,160 @@
+Pyflate Optimization 3: Length-Indexed Huffman Decode
+=====================================================
+
+Date   : 2026-09-21
+Commit : 61362f4
+File   : bm_pyflate_opt/run_benchmark.py
+Target : HuffmanTable.find_next_symbol (line 224)
+
+
+The change
+----------
+
+Before, one linear scan over the whole table per decoded symbol:
+
+    def find_next_symbol(self, field, reversed=True):
+        cached_length = -1
+        cached = None
+        for x in self.table:
+            if cached_length != x.bits:
+                cached = field.snoopbits(x.bits)
+                cached_length = x.bits
+            if (reversed and x.reverse_symbol == cached) or \
+               (not reversed and x.symbol == cached):
+                field.readbits(x.bits)
+                return x.code
+        raise Exception(...)
+
+After, one dict lookup per distinct code length:
+
+    def find_next_symbol(self, field, reversed=True):
+        lookup = self.reverse_lookup if reversed else self.forward_lookup
+        snoopbits = field.snoopbits
+        for bits in self.bit_lengths:
+            code = lookup[bits].get(snoopbits(bits))
+            if code is not None:
+                field.readbits(bits)
+                return code
+        raise Exception(...)
+
+The tables are built once per Huffman table by a new _build_lookup,
+invoked at the end of populate_huffman_symbols (which is where symbol
+and reverse_symbol are assigned, and which every construction path
+calls before decoding - see compute_tables lines 388-390 and the three
+DEFLATE sites at 546-547 and 581-585).
+
+    def _build_lookup(self):
+        self.bit_lengths = []
+        forward = {}
+        reverse = {}
+        for x in self.table:
+            if x.bits not in forward:
+                self.bit_lengths.append(x.bits)
+                forward[x.bits] = {}
+                reverse[x.bits] = {}
+            forward[x.bits].setdefault(x.symbol, x.code)
+            reverse[x.bits].setdefault(x.reverse_symbol, x.code)
+        self.forward_lookup = forward
+        self.reverse_lookup = reverse
+
+The unreachable code that previously followed find_next_symbol's raise
+statement was deleted in the same commit. It was an unfinished
+length-indexed lookup - the author's own abandoned attempt at this
+optimization - and keeping a dead second implementation beside the
+working one would be actively misleading.
+
+
+Equivalence argument
+--------------------
+
+Three details make the rewrite exactly equivalent:
+
+  1. Scan order. self.table is sorted by (bits, code) in
+     HuffmanTable.__init__ via HuffmanLength._sort_func, so iterating it
+     produces distinct bit lengths in ascending order. self.bit_lengths
+     is collected in that same iteration, so the new loop tries lengths
+     in the original order.
+
+  2. Tie-breaking. setdefault keeps the FIRST code registered for a
+     given (length, symbol value) pair, matching the original's
+     first-match-wins scan. Canonical Huffman coding should never
+     produce a duplicate, so this is defensive rather than necessary.
+
+  3. Falsy codes. The hit test is "code is not None" rather than a
+     truth test, because symbol code 0 is legitimate and would be
+     falsy.
+
+
+Verification
+------------
+
+The bundled MD5 assertion only exercises reversed=False, because the
+test data is bzip2; the reversed=True path belongs to DEFLATE and is
+never reached by this benchmark. A differential test was therefore
+written to cover both directions - see tests/test_huffman_equivalence.py.
+
+It drives the original and optimized implementations with identical
+randomly generated tables and identical bit patterns, comparing the
+returned code, the number of bits consumed, and whether the call raised:
+
+    compared 24000 decode attempts across both directions
+    no mismatches
+
+Confirmed both on the development machine and in the benchmark VM.
+The bundled MD5 gate also passes.
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    opt2 (move_to_front rewrite) : 865 ms +- 7 ms
+    opt3 (this change)           : 799 ms +- 7 ms
+
+Isolated contribution:
+
+    python3 -m pyperf compare_to \
+        results/pyflate_opt2.json results/pyflate_opt3.json
+    => 1.08x faster, 7.6% reduction
+
+Cumulative against the original baseline:
+
+    python3 -m pyperf compare_to \
+        results/pyflate_baseline.json results/pyflate_opt3.json
+    => 1.11 sec -> 799 ms: 1.39x faster
+    => ~311 ms saved, 28.0% reduction
+
+
+Estimate versus result: an instructive miss
+-------------------------------------------
+
+Predicted 15-25%; measured 7.6%. The prediction was wrong for a reason
+worth recording.
+
+find_next_symbol accounted for 1.052 s of the 2.132 s spent in
+decode_huffman_block, and that 49% figure drove the estimate. But 1.052 s
+is CUMULATIVE time, which includes the function's children: snoopbits
+(0.484 s cumulative) and readbits. Those are irreducible - decoding a
+symbol requires reading its bits from the stream - and the original
+already avoided redundant peeking through its cached_length guard, so
+the optimized version issues approximately the same number of snoopbits
+calls.
+
+What the rewrite actually eliminated was the Python-level scan itself:
+find_next_symbol's SELF time of 0.333 s, or 15.5% of instrumented
+runtime. Capturing roughly half of that is consistent with the measured
+7.6%.
+
+The general lesson: cumulative time identifies where a program spends
+its life, but the addressable fraction is bounded by self time plus
+whatever calls an optimization removes outright. Optimizations 1 and 2
+targeted self time and eliminated calls, and both beat their estimates;
+this one was estimated against cumulative time and fell short.
+
+Complexity note: the asymptotic improvement is real but bounded. Per
+symbol the original walked the table until it matched, while the new
+code performs at most (max_bits - min_bits + 1) dict lookups. For bzip2
+with up to 258 symbols and code lengths of 1-20, that is a worthwhile
+reduction in constant factor, but the per-symbol bit reading that
+remains dominates what is left.
