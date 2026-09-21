@@ -108,52 +108,63 @@ stage_flame() {
     fi
 
     # cpu-clock rather than cycles: the guest has no PMU.
-    # DWARF rather than frame pointers: the debug build paints freed
-    # memory with 0xFD/0xDD and the frame-pointer unwinder reports those
-    # fill bytes as return addresses, producing a meaningless graph.
-    perf record -e cpu-clock -F 299 --call-graph dwarf \
-        -o /tmp/pyflate_dwarf.data \
-        -- python3-dbg "$REPO/profile_pyflate.py" \
-              --variant "$BASE_DIR" --loops 2
+    #
+    # Frame-pointer unwinding (-g) on the STOCK interpreter. The two
+    # choices are tied together and cannot be made separately:
+    #
+    #   * -g must not be combined with python3-dbg. The debug build
+    #     paints memory with 0xFD (PYMEM_FORBIDDENBYTE) and 0xDD
+    #     (PYMEM_DEADBYTE), and the frame-pointer unwinder walks that
+    #     painted memory and reports the fill bytes as return addresses.
+    #     See section 1b of results/raytrace_perf_baseline.txt. Those
+    #     graphs are garbage, not merely shallow.
+    #
+    #   * DWARF unwinding needs debug information, which the stock
+    #     interpreter does not carry, so dropping python3-dbg means
+    #     dropping DWARF with it.
+    #
+    # What this configuration buys: the profile now measures the same
+    # interpreter that produced the headline timings, so the ~12%
+    # debug-allocator overhead is gone and the perf-attributed speedup
+    # should agree with pyperf's 1.61x instead of reading 1.54x.
+    #
+    # What it costs: Ubuntu builds python3 with -fomit-frame-pointer, so
+    # there are frequently no frame pointers to walk and stacks come
+    # back short. The stock binary is also stripped, so static internal
+    # functions resolve as [unknown]. Frame pointers carry no per-sample
+    # stack snapshot, which is why the rate and loop count go back up.
+    perf record -e cpu-clock -F 999 -g \
+        -o /tmp/pyflate_fp.data \
+        -- python3 "$REPO/profile_pyflate.py" \
+              --variant "$BASE_DIR" --loops 5
 
-    # Two separate things make a DWARF-unwound CPython flame graph
-    # unreadable, and they need different fixes.
-    #
-    # HEIGHT, and the box count that follows from it. Reaching one Python
-    # call costs a cycle of seven C frames (_PyEval_Vector,
-    # _PyEval_EvalFrame, _PyEval_EvalFrameDefault, call_function,
-    # PyObject_Vectorcall, _PyObject_VectorcallTstate,
-    # _PyFunction_Vectorcall) and that cycle repeats once per level of
-    # Python call depth. Measured on the previous graph: _PyEval_Vector
-    # appeared 373 times and the image was 138 rows tall.
-    #
-    # Note that stackcollapse-recursive.pl does NOT help here. It merges
-    # only ADJACENT duplicate frames, and this is a cycle of seven
-    # distinct names with no adjacent duplicates, so it collapses
-    # nothing. tools/collapse_interpreter.py folds each run of plumbing
-    # frames into one [python call] frame instead, which also merges
-    # identical leaves that were previously scattered across hundreds of
-    # spine depths. Sample counts are preserved exactly.
-    #
-    # WIDTH. Even after that, sub-1% frames remain, and at 5,536 boxes
-    # 96% of them were narrower than 1%. A box that thin cannot hold a
-    # label, and those boxes are most of the 1.0 MB file. --minwidth
-    # drops them.
+    # The interpreter collapse still applies to whatever call chain does
+    # come back; it is a no-op when the pattern is absent and stays in
+    # the pipeline so both stages render identically. Sub-1% frames are
+    # too thin to label and are most of the file size, so they go.
     local minwidth=1
 
-    perf script -i /tmp/pyflate_dwarf.data > /tmp/pyflate.perf
+    perf script -i /tmp/pyflate_fp.data > /tmp/pyflate.perf
     "$fg/stackcollapse-perf.pl" /tmp/pyflate.perf \
         | "$REPO/tools/collapse_interpreter.py" > /tmp/pyflate.folded
     "$fg/flamegraph.pl" \
-        --title "pyflate baseline (cpu-clock, DWARF unwind)" \
-        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --title "pyflate baseline (cpu-clock, frame pointers)" \
+        --subtitle "stock python3; frames under ${minwidth}% omitted" \
         --minwidth "$minwidth" \
         /tmp/pyflate.folded > "$RESULTS/pyflate_baseline_flame.svg"
 
     echo "wrote $RESULTS/pyflate_baseline_flame.svg"
 
+    # How deep the stacks actually came back. With -fomit-frame-pointer
+    # this is the number that decides whether the graph is usable, so it
+    # is reported rather than left for the reader to discover.
+    say "stack depth returned by the unwinder"
+    awk -F';' '{d=NF; s+=d; n++; if(d>m)m=d}
+               END {printf "mean %.1f frames, max %d, over %d stacks\n", s/n, m, n}' \
+        /tmp/pyflate.folded
+
     say "perf self-time ranking"
-    perf report -i /tmp/pyflate_dwarf.data --stdio --no-children -g none \
+    perf report -i /tmp/pyflate_fp.data --stdio --no-children -g none \
         2>/dev/null | head -30
 }
 
@@ -173,19 +184,30 @@ stage_flamecmp() {
     # the difference between them reflects the collection settings rather
     # than the optimizations. The baseline is therefore regenerated here
     # rather than reusing whatever is already on disk.
-    local loops=2 freq=299
+    # -g on stock python3 rather than DWARF on python3-dbg; see
+    # stage_flame for why those two choices are inseparable and what the
+    # trade is. Frame pointers store no per-sample stack snapshot, so
+    # the rate and loop count are higher than the DWARF runs needed.
+    local loops=5 freq=999
 
     local variant
     for variant in "$BASE_DIR" "$OPT_DIR"; do
         echo "--- profiling $variant ---"
-        perf record -e cpu-clock -F "$freq" --call-graph dwarf \
+        perf record -e cpu-clock -F "$freq" -g \
             -o "/tmp/${variant}.data" \
-            -- python3-dbg "$REPO/profile_pyflate.py" \
+            -- python3 "$REPO/profile_pyflate.py" \
                   --variant "$variant" --loops "$loops"
         perf script -i "/tmp/${variant}.data" > "/tmp/${variant}.perf"
         "$fg/stackcollapse-perf.pl" "/tmp/${variant}.perf" \
             | "$REPO/tools/collapse_interpreter.py" \
             > "/tmp/${variant}.folded"
+
+        # Frame pointers may be absent, in which case stacks come back
+        # only a frame or two deep and the graph degenerates. Report it
+        # per variant so that is visible immediately.
+        awk -F';' '{d=NF; s+=d; n++; if(d>m)m=d}
+                   END {printf "  %d stacks, mean depth %.1f, max %d\n",
+                                n, s/n, m}' "/tmp/${variant}.folded"
     done
 
     # collapse_interpreter.py (see stage_flame) fixes the height. What
@@ -211,16 +233,16 @@ stage_flamecmp() {
     echo "minwidth: baseline ${base_mw}%, optimized ${opt_mw}%" \
          "(equal absolute time)"
 
-    local sub="interpreter call frames collapsed; frames under 1% of baseline time omitted"
+    local sub="stock python3; frames under 1% of baseline time omitted"
 
     "$fg/flamegraph.pl" \
-        --title "pyflate BASELINE (cpu-clock, DWARF unwind)" \
+        --title "pyflate BASELINE (cpu-clock, frame pointers)" \
         --subtitle "$sub" \
         --minwidth "$base_mw" \
         "/tmp/$BASE_DIR.folded" > "$RESULTS/pyflate_baseline_flame.svg"
 
     "$fg/flamegraph.pl" \
-        --title "pyflate OPTIMIZED (cpu-clock, DWARF unwind)" \
+        --title "pyflate OPTIMIZED (cpu-clock, frame pointers)" \
         --subtitle "$sub" \
         --minwidth "$opt_mw" \
         "/tmp/$OPT_DIR.folded" > "$RESULTS/pyflate_optimized_flame.svg"
