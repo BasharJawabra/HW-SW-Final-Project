@@ -1,0 +1,158 @@
+Pyflate Hardware Acceleration - Opportunity Analysis
+====================================================
+
+Date    : 2026-09-21
+Subject : how much of the OPTIMIZED pyflate the Huffman accelerator can
+          absorb, and what end-to-end speedup that permits
+
+The question this answers is deliberately narrow. The accelerator is
+worth proposing only if the work it removes is a large share of what
+remains AFTER the software optimizations, not of the original baseline.
+    10|Quoting the baseline's numbers would credit the hardware with work
+already eliminated in software.
+
+
+Profile of the optimized benchmark
+----------------------------------
+
+    python3 profile_pyflate.py --variant bm_pyflate_opt \
+        --loops 5 --cprofile --limit 18
+
+    10,809,699 function calls in 7.917 seconds (5 decompressions)
+    20|
+    ncalls     tottime  cumtime  function
+      741355     1.532    4.463  HuffmanTable.find_next_symbol  (240)
+           5     1.452    7.908  decode_huffman_block           (400)
+     1708005     0.918    1.978  RBitfield.snoopbits            (112)
+      783540     0.762    0.779  RBitfield.readbits             (117)
+           5     0.555    1.209  bwt_reverse                    (312)
+           5     0.389    0.510  bwt_transform                  (298)
+      337810     0.383    0.880  RBitfield._more                (106)
+      337810     0.320    0.444  BitfieldBase._read             (43)
+    30|      464015     0.311    0.548  move_to_front                  (294)
+     2409550     0.242    0.242  list.append                    (builtin)
+     1708005     0.228    0.228  dict.get                       (builtin)
+      337630     0.197    1.076  BitfieldBase.needbits          (50)
+      464015     0.129    0.129  list.insert                    (builtin)
+           5     0.110    0.110  sorted                         (builtin)
+      464015     0.108    0.108  list.pop                       (builtin)
+      337810     0.071    0.071  BufferedReader.read            (builtin)
+      352690     0.055    0.055  len                            (builtin)
+      337830     0.052    0.052  ord                            (builtin)
+    40|
+Per decompression that is 148,271 decoded symbols, identical to the
+baseline, which confirms the optimizations changed how symbols are
+decoded and not how many.
+
+
+The share went UP, which is the point
+-------------------------------------
+
+find_next_symbol's cumulative share of the run:
+    50|
+    baseline   1.052 s of 2.132 s   49.3%
+    optimized  4.463 s of 7.908 s   56.4%
+
+It is worth being clear about why optimizing something increased its
+share. The Huffman rework (length-indexed dict) gained 7.6%. The other
+four optimizations - inlined bit masks, move_to_front, the RLE length
+hoist, and batching literal spans - together gained considerably more,
+and all of them applied to non-Huffman work. Shrinking everything else
+    60|made the residue loom larger.
+
+This is Amdahl's law read in the other direction, and it is the honest
+argument for the accelerator: Huffman decode is the part of pyflate
+that resisted software optimization, and it is now the part that
+dominates. A component that stays expensive after a serious software
+effort is a better hardware candidate than one that merely looked
+expensive before any effort at all.
+
+
+    70|Correcting for profiler overhead
+--------------------------------
+
+56.4% is an overstatement. cProfile charges roughly a fixed cost per
+call, and this subtree is unusually call-dense: 6.63 M of the run's
+10.81 M calls occur beneath find_next_symbol.
+
+    measured under cProfile     7.908 s   (5 loops)
+    real, from pyperf             3.450 s   (5 x 690 ms)
+    overhead                      4.458 s over 10,809,699 calls
+    80|                                = 0.412 us per call
+
+    subtree calls               6,629,795
+    subtree overhead            2.734 s
+    subtree time, corrected     4.463 - 2.734 = 1.729 s
+    corrected share f           1.729 / 3.450 = 50.1%
+
+So the hardware-replaceable fraction is about 50% of the optimized
+runtime, not 56%. The correction assumes cProfile's per-call cost is
+uniform across call types, which is approximate: a call into a C
+    90|builtin is cheaper to instrument than a Python-level call. The figure
+should be read as "about half", and the sensitivity is given below
+rather than a single number being defended to three digits.
+
+
+Ceiling on end-to-end speedup
+-----------------------------
+
+With fraction f moved to hardware and the hardware treated as free,
+the whole-program speedup is 1/(1-f):
+
+   100|    f = 0.45    1.82x
+    f = 0.50    2.00x
+    f = 0.56    2.27x
+
+The accelerator is close enough to free for this to be a fair framing.
+At the simulated 1.02 cycles per symbol, 148,271 symbols take:
+
+    100 MHz    1.51 ms per decompression
+    200 MHz    0.76 ms
+    400 MHz    0.38 ms
+
+   110|against roughly 345 ms of software that remains. Even at 100 MHz the
+decoder contributes under half a percent of the new runtime, so the
+result is bounded by Amdahl's law and not by the hardware's throughput.
+Clocking it faster is pointless here; the design is already so far
+ahead of the surrounding software that the frequency target is set by
+what integrates comfortably, not by what the workload needs.
+
+Expected result: pyflate falls from 690 ms to roughly 350 ms, a ~2.0x
+hardware speedup on top of the 1.61x already obtained in software, for
+about 3.2x against the 1.11 s original baseline.
+   120|
+
+The assumption that would invalidate this
+-----------------------------------------
+
+The estimate assumes decoded symbols reach software in bulk. They must
+be DMA'd into a buffer that Python then consumes as a single object.
+
+If instead software read one symbol per memory-mapped load, the Python
+interpreter would execute ~148,271 read operations per decompression.
+   130|At even 1 us per Python-level MMIO access that is ~148 ms, which would
+consume most of the 345 ms the accelerator was supposed to save. The
+decoder would be fast and the system would not be.
+
+This is the single most important integration constraint in the design
+and it is a software-side constraint, not a hardware one. It is why the
+proposed interface DMAs a symbol array rather than exposing a
+"read next symbol" register.
+
+
+   140|Why not accelerate more of the pipeline
+---------------------------------------
+
+Once Huffman decode is removed, the remaining ~345 ms is dominated by
+bwt_reverse, bwt_transform and the MTF stage. Accelerating those too
+would raise f, but each addition widens the hardware/software boundary
+and increases the data that must cross it, and the returns follow
+1/(1-f) which is still gentle in this range: taking f from 0.50 to 0.65
+buys 2.00x -> 2.86x.
+
+   150|The stronger reason to stop at Huffman decode is that it is the part
+whose cost is intrinsic to sequential bit-serial work, which general
+purpose hardware handles badly and dedicated hardware handles well.
+The inverse BWT is a large permutation, which is a memory bandwidth
+problem rather than a control problem, and a CPU with a cache is not
+obviously the wrong machine for it.
