@@ -164,6 +164,34 @@ that is merely applied, and the target was already exceeded.
 
 Regenerate with:  ./script_<name>.sh flamecmp
 
+How they are collected
+
+    perf record -e cpu-clock -F 999 -g  against the stock python3.
+    cpu-clock rather than cycles because the QEMU guest exposes no PMU,
+    so these measure elapsed time, not retired cycles. See the section
+    below on why the stock interpreter rather than python3-dbg.
+
+    Three post-processing steps, all of which preserve sample counts:
+
+    1. tools/collapse_interpreter.py folds each run of CPython call
+       plumbing into one [python call] frame, and each run of
+       unresolvable frames into one [unresolved] frame. Without this the
+       DWARF graphs were 127 rows tall with _PyEval_Vector appearing
+       809 times, because reaching one Python call costs a repeating
+       cycle of seven C frames.
+
+    2. flamegraph.pl --minwidth drops frames too thin to carry a label;
+       they were 92% of the 9,525 boxes and most of the file size.
+
+    3. The threshold is equal in ABSOLUTE time on both sides, not equal
+       as a percentage. --minwidth is a percentage of each run's own
+       total, and the optimized run is shorter, so a flat 1% was a
+       smaller absolute threshold on the optimized side and admitted
+       thinner stacks: baseline rendered 40 rows against optimized 73.
+       1% of the baseline is now the common threshold and the optimized
+       percentage is scaled by the ratio of the totals. This matters for
+       the same reason the collection parameters are held identical.
+
 Reading the differential graphs
 
     Width is time; colour is the change between baseline and optimized.
@@ -187,40 +215,59 @@ Reading the differential graphs
 
 
 ================================================================
- WHY THE FLAME GRAPH RATIOS DIFFER FROM THE HEADLINE SPEEDUPS
+ THE PROFILER USED TO DISAGREE WITH THE BENCHMARK, AND NO LONGER DOES
 ================================================================
 
-This needs stating explicitly, because the two sets of numbers look
-like they disagree.
+Worth recording in full, because the disagreement was real, the cause
+was diagnosed from the profile itself, and acting on the diagnosis
+removed it. That last step is what turns a plausible explanation into a
+tested one.
 
-    benchmark   under python3-dbg      under python3 (pyperf)
-    ---------------------------------------------------------------
-    pyflate     6.362 -> 4.057 s      1.61x
-                = 1.57x
-    raytrace    6.460 -> 3.604 s      1.60x
-                = 1.79x
+The original flame graphs used DWARF unwinding, which needs debug
+information, which only python3-dbg carries. Against pyperf they read:
 
-Flame graphs must be collected with python3-dbg, because the stock
-interpreter is stripped and DWARF unwinding needs its debug
-information. But the debug build writes guard bytes around every
-allocation and re-validates them on free - the _PyMem_DebugCheckAddress
-/ read_size_t / write_size_t entries that account for roughly 12% of
-the profile.
+    benchmark   perf, python3-dbg    pyperf, python3
+    ---------------------------------------------------------
+    pyflate     1.54x - 1.57x        1.61x
+    raytrace    1.79x                1.60x
 
-That inflates the value of any optimization which works by NOT
-allocating. Two of raytrace's three changes do exactly that: __slots__
-deletes the per-instance __dict__ for millions of Vectors, and the
-shadow-ray hoist deletes whole subtrees of temporary objects. So the
-debug interpreter flatters them, and raytrace appears 1.79x faster
-there against 1.60x in reality.
+The debug build writes guard bytes around every allocation and
+re-validates them on free: the _PyMem_DebugCheckAddress, read_size_t
+and write_size_t entries were roughly 12% of the profile. That inflates
+any optimization which works by NOT allocating, and two of raytrace's
+three changes do exactly that, since __slots__ deletes the per-instance
+__dict__ for millions of Vectors and the shadow-ray hoist deletes whole
+subtrees of temporaries. pyflate showed a smaller gap because its wins
+are more mixed: the length-indexed decode adds dictionary work as it
+removes the scan.
 
-pyflate shows no such gap (1.57x against 1.61x) because its wins are
-more mixed - the length-indexed decode adds dictionary work as it
-removes the scan, so it gains less from cheaper allocation.
+That diagnosis makes a testable prediction. Profile the STOCK
+interpreter and the gap should close. Frame-pointer unwinding allows
+it, because it needs no debug information:
 
-Conclusion: the flame graphs are a valid picture of WHERE time went and
-WHAT was removed. They are not a measurement of the speedup. Quote
-1.60x and 1.61x from pyperf; treat the graphs as qualitative.
+    benchmark   perf, stock python3   pyperf, python3
+    -----------------------------------------------------------
+    pyflate     5.701 -> 3.595 s      1.61x
+                = 1.59x
+    raytrace    4.118 -> 2.597 s      1.60x
+                = 1.59x
+
+Both agree to within 0.02x. The debug allocator accounted for the
+entire discrepancy, so the graphs now measure the same interpreter that
+produced the headline timings and their ratios can be quoted directly
+rather than discounted as qualitative.
+
+The switch is not free, and the cost is stack quality. Ubuntu compiles
+python3 with -fomit-frame-pointer, so mean stack depth was only 5 to 7
+frames and some stacks unwound into towers of unresolvable addresses,
+now collapsed to a single [unresolved] frame carrying 3.8-4.0% of self
+time. The graphs are 4 rows tall against 40 for the DWARF versions:
+they rank self time reliably, but no longer show much call hierarchy.
+In particular the operator-dispatch chain DWARF exposed
+(PyNumber_Subtract -> binary_op -> slot_nb_subtract ->
+vectorcall_unbound, the machinery behind Vector.__sub__ being a Python
+dunder) is absent from them. That evidence survives in the perf report
+self-time rankings and in the cProfile data.
 
 
 ================================================================
