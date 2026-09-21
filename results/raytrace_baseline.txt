@@ -1,0 +1,43 @@
+Raytrace Baseline Measurement
+=============================
+
+Date      : 2026-09-21
+Benchmark : bm_raytrace/run_benchmark.py (pristine pyperformance source)
+
+Environment
+-----------
+Host        : QEMU/KVM guest (user-mode networking, 10.0.2.15)
+Guest OS    : Ubuntu 22.04.5 LTS
+Kernel      : 5.15.0-1106-kvm x86_64
+Python      : 3.10.12 (main, Aug 31 2026, 10:18:17) [GCC 11.4.0]
+pyperf      : 2.10.0
+perf        : 5.15.209
+python3-dbg : present (/usr/bin/python3-dbg)
+
+Run configuration
+-----------------
+Reused verbatim for every post-optimization comparison so that results
+stay directly comparable.
+
+    python3 bm_raytrace/run_benchmark.py \
+        -o results/raytrace_baseline.json \
+        -p 10 -w 1 -n 5
+
+    -p 10   10 independent worker processes
+    -w 1    1 warmup value per process (discarded)
+    -n 5    5 measured values per process
+
+Image geometry is the benchmark default, 100x100 pixels
+(DEFAULT_WIDTH / DEFAULT_HEIGHT in run_benchmark.py).
+
+Result
+------
+raytrace: Mean +- std dev: 799 ms +- 4 ms
+
+Interpretation
+--------------
+Relative standard deviation is approximately 0.5%, so run-to-run noise
+is negligible compared with the >=7% improvement the project requires.
+A saving of >=56 ms is therefore measurable with confidence, and any
+apparent gain smaller than roughly 12 ms (3 sigma) should be treated as
+noise rather than a real improvement.
