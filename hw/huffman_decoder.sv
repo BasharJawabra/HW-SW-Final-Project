@@ -197,8 +197,12 @@ module huffman_decoder #(
         sel_len = 5'd1;
         for (int L = MAX_CODE_LEN; L >= 1; L = L - 1) begin
             if (hit[L]) begin
+                // Plain assignment rather than a bit-select on the loop
+                // variable: selecting bits of an int inside always_* is not
+                // universally supported, and L is bounded by MAX_CODE_LEN so
+                // the implicit narrowing to 5 bits is lossless.
                 sel_hit = 1'b1;
-                sel_len = L[4:0];
+                sel_len = L;
             end
         end
     end
