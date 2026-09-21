@@ -1,0 +1,200 @@
+Pyflate Baseline Measurement and Hotspot Analysis
+=================================================
+
+Date      : 2026-09-21
+Benchmark : bm_pyflate/run_benchmark.py (pristine pyperformance source)
+Workload  : bm_pyflate/data/interpreter.tar.bz2 (66 KB, bzip2)
+
+
+What the benchmark does
+-----------------------
+
+Pyflate is a stand-alone pure-Python bzip2 and DEFLATE decompressor
+(Paul Sladen, 2006-2007). bench_pyflake reads the magic number and
+dispatches: the bundled test file is bzip2 (magic 0x425a), so the
+measured path is bzip2_main -> decode_huffman_block, and the entire
+gzip_main / DEFLATE half of the module is never executed.
+
+The decode pipeline per block is:
+
+    RBitfield          bit-level reader over the compressed stream
+    compute_used       which byte values occur (2-level bitmap)
+    compute_tables     build the Huffman tables for this block
+    decode_huffman_block
+      -> find_next_symbol     Huffman symbol decode, per symbol
+      -> move_to_front        MTF decode, per symbol
+      -> bwt_reverse          inverse Burrows-Wheeler transform
+      -> final RLE expansion
+
+Data structures: HuffmanTable holds a flat Python list of HuffmanLength
+objects (code, bits, symbol, reverse_symbol); the MTF stage keeps a
+plain Python list of single-byte bytes objects; output is accumulated in
+a list and joined.
+
+Correctness is self-verifying. bench_pyflake hashes the decompressed
+result and raises on mismatch:
+
+    if hashlib.md5(out).hexdigest() != "afa004a630fe072901b1d9628b960974":
+        raise Exception("MD5 checksum mismatch")
+
+Any optimization that corrupts the output therefore fails loudly rather
+than silently producing a fast wrong answer. No external correctness
+harness is needed for this benchmark.
+
+
+Baseline
+--------
+
+Environment as recorded in results/raytrace_baseline.txt
+(Ubuntu 22.04.5, kernel 5.15.0-1106-kvm, Python 3.10.12, pyperf 2.10.0).
+
+    python3 bm_pyflate/run_benchmark.py \
+        -o results/pyflate_baseline.json \
+        -p 10 -w 1 -n 5
+
+    pyflate: Mean +- std dev: 1.11 sec +- 0.01 sec
+
+Relative standard deviation ~0.9%, so the >=7% target (>=78 ms) is well
+outside the noise band.
+
+
+cProfile hotspots
+-----------------
+
+    python3 -c "... cProfile around bench_pyflake(1, data) ..."
+
+    3,185,461 function calls in 2.154 s (single decompression)
+
+    ncalls   tottime   cumtime  function
+         1     0.488     2.132  decode_huffman_block        (line 394)
+    148271     0.333     1.052  HuffmanTable.find_next_symbol (line 224)
+    341601     0.222     0.484  RBitfield.snoopbits         (line 112)
+     92803     0.210     0.210  move_to_front               (line 288)
+    156708     0.189     0.251  RBitfield.readbits          (line 117)
+    655017     0.128     0.128  BitfieldBase._mask          (line 54)
+         1     0.111     0.243  bwt_reverse                 (line 306)
+         1     0.078     0.103  bwt_transform               (line 292)
+    766811     0.073     0.073  list.append                 (builtin)
+     67562     0.072     0.159  RBitfield._more             (line 106)
+    674570     0.069     0.069  len                         (builtin)
+     67562     0.054     0.076  BitfieldBase._read          (line 43)
+     67526     0.038     0.197  BitfieldBase.needbits       (line 50)
+         2     0.027     0.027  bytes.join                  (builtin)
+         1     0.023     0.023  sorted                      (builtin)
+     67562     0.013     0.013  BufferedReader.read         (builtin)
+     76108     0.011     0.011  ord                         (builtin)
+         1     0.004     0.019  compute_selectors_list      (line 355)
+       882     0.003     0.003  reverse_bits                (line 153)
+       256     0.002     0.002  bytes.find                  (builtin)
+
+
+Findings
+--------
+
+1. Huffman symbol decode is a linear table scan (largest opportunity)
+
+   find_next_symbol accounts for 1.052 s cumulative of the 2.132 s
+   spent in decode_huffman_block, i.e. roughly 49% of decode time, over
+   148,271 invocations (one per decoded symbol).
+
+   The implementation walks the entire table entry by entry:
+
+       for x in self.table:
+           if cached_length != x.bits:
+               cached = field.snoopbits(x.bits)
+               cached_length = x.bits
+           if (reversed and x.reverse_symbol == cached) or \
+              (not reversed and x.symbol == cached):
+               field.readbits(x.bits)
+               return x.code
+
+   The cached_length guard limits bit-peeking to one snoop per distinct
+   code length (341,601 snoops / 148,271 symbols = 2.3 per symbol), but
+   the Python-level loop over table entries still runs to the matching
+   entry every time, and the table holds up to symbols_in_use entries.
+
+   This is the weakness the module's own docstring admits: "there is
+   certainly some room for improvement in the Huffman bit-matcher".
+
+   The author evidently started a table-driven replacement and never
+   finished it:
+
+     - tables_by_bits (line 202) builds a dict keyed by code length and
+       never returns it. It is called from nowhere in the module, so the
+       missing return statement has no runtime effect; it is abandoned
+       scaffolding rather than a live defect.
+
+     - find_next_symbol contains a second, length-indexed lookup loop
+       (lines 237-243) placed AFTER an unconditional raise, making it
+       unreachable dead code.
+
+     - _find_symbol (line 218) is only reachable from that dead code.
+
+     - min_max_bits IS called (lines 389, 547, 584, 585), so min_bits
+       and max_bits are populated and available for a real
+       length-indexed implementation.
+
+   Planned replacement: build, once per table, a dict mapping code
+   length -> {symbol value -> code}, then decode by trying lengths from
+   min_bits to max_bits with a single dict lookup each. That converts
+   per-symbol work from a scan over all entries into at most
+   (max_bits - min_bits + 1) hash lookups.
+
+2. A one-line helper called 655,017 times
+
+   BitfieldBase._mask is
+
+       def _mask(self, n):
+           return (1 << n) - 1
+
+   invoked 655,017 times from snoopbits and readbits for 0.128 s of
+   self time. This is the same pattern that dominated the raytrace
+   baseline: a trivial function whose Python call overhead exceeds its
+   body. Inlining the expression at its call sites removes 655,017
+   frame allocate/deallocate pairs.
+
+3. move_to_front rebuilds the list on every symbol
+
+       def move_to_front(l, c):
+           l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
+
+   92,803 calls, 0.210 s of self time and no children. Each call creates
+   three slice objects, concatenates them into a fourth list, then
+   assigns over the original. The equivalent single-element rotation is
+   l.insert(0, l.pop(c)), which performs the same move using two C-level
+   operations and no intermediate lists.
+
+4. len() recomputed inside the RLE loop
+
+   len is called 674,570 times. A large share comes from the final
+   run-length expansion in decode_huffman_block:
+
+       while i < len(nearly_there):
+           if i < len(nearly_there) - 4 and ...
+
+   nearly_there is immutable for the duration of the loop, so its length
+   can be computed once. The same loop also slices single bytes
+   (nearly_there[i:i + 1]) rather than indexing, allocating a bytes
+   object per character.
+
+5. bwt_transform computes character counts the slow way
+
+   The function's own comment calls it a "semi-inefficient way to get
+   the character counts": it sorts the whole block (sorted, 0.023 s) and
+   then performs 256 bytes.find calls to locate each symbol's first
+   occurrence. A 256-bin histogram plus a prefix sum is O(n + 256) with
+   no sort. Total cost here is only 0.103 s cumulative, so this is a
+   lower priority than items 1-4.
+
+
+Planned optimizations, in implementation order
+----------------------------------------------
+  1. Inline _mask at its call sites in snoopbits / readbits
+  2. Replace move_to_front's slice-rebuild with pop/insert
+  3. Replace find_next_symbol's linear scan with a length-indexed dict
+  4. Hoist len() out of the RLE loop and index instead of slicing
+  5. Replace bwt_transform's sort+find with a histogram prefix sum
+
+Ordered easiest-first so that each change is measured in isolation
+before the more invasive Huffman rework. Item 3 is expected to
+contribute the most.
