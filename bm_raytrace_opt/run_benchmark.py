@@ -281,8 +281,9 @@ class Scene(object):
             self.recursionDepth = self.recursionDepth - 1
 
     def _lightIsVisible(self, l, p):
+        shadowRay = Ray(p, l - p)
         for (o, s) in self.objects:
-            t = o.intersectionTime(Ray(p, l - p))
+            t = o.intersectionTime(shadowRay)
             if t is not None and t > EPSILON:
                 return False
         return True
