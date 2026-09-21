@@ -291,15 +291,26 @@ stage_pyflame() {
             "/tmp/${variant}.pyfolded"
     done
 
+    # --minwidth trades a little completeness for legibility. Without it
+    # the graph is ~64 rows tall, but half those rows exist only to hold
+    # 1-sample slivers from interpreter startup (importlib, sre_parse).
+    # At ~1250 samples 0.5% is about 6 samples, and a box that thin
+    # cannot fit a label, so those rows cost height without conveying
+    # anything. The threshold is named in the subtitle rather than
+    # applied silently.
+    local minwidth=0.5
+
     "$fg/flamegraph.pl" \
         --title "pyflate BASELINE - Python level (py-spy, ${rate} Hz)" \
-        --subtitle "${loops} decompressions on python3; every frame is a benchmark function" \
+        --subtitle "${loops} decompressions on python3; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         "/tmp/$BASE_DIR.pyfolded" \
         > "$RESULTS/pyflate_baseline_python_flame.svg"
 
     "$fg/flamegraph.pl" \
         --title "pyflate OPTIMIZED - Python level (py-spy, ${rate} Hz)" \
-        --subtitle "${loops} decompressions on python3; every frame is a benchmark function" \
+        --subtitle "${loops} decompressions on python3; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         "/tmp/$OPT_DIR.pyfolded" \
         > "$RESULTS/pyflate_optimized_python_flame.svg"
 
