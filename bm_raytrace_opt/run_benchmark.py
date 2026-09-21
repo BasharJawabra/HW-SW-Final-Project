@@ -21,6 +21,8 @@ EPSILON = 0.00001
 
 class Vector(object):
 
+    __slots__ = ('x', 'y', 'z')
+
     def __init__(self, initx, inity, initz):
         self.x = initx
         self.y = inity
@@ -92,6 +94,8 @@ assert Vector(-1, -1, 0).reflectThrough(Vector.UP) == Vector(-1, 1, 0)
 
 class Point(object):
 
+    __slots__ = ('x', 'y', 'z')
+
     def __init__(self, initx, inity, initz):
         self.x = initx
         self.y = inity
@@ -127,6 +131,8 @@ class Point(object):
 
 class Sphere(object):
 
+    __slots__ = ('centre', 'radius')
+
     def __init__(self, centre, radius):
         centre.mustBePoint()
         self.centre = centre
@@ -150,6 +156,8 @@ class Sphere(object):
 
 class Halfspace(object):
 
+    __slots__ = ('point', 'normal')
+
     def __init__(self, point, normal):
         self.point = point
         self.normal = normal.normalized()
@@ -169,6 +177,8 @@ class Halfspace(object):
 
 
 class Ray(object):
+
+    __slots__ = ('point', 'vector')
 
     def __init__(self, point, vector):
         self.point = point
