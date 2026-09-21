@@ -143,6 +143,19 @@ These are collected with `perf record -e cpu-clock --call-graph dwarf` and
 rendered with Brendan Gregg's `flamegraph.pl`. Two things about them need
 stating up front, because both look like defects otherwise.
 
+They are collected with frame-pointer unwinding (`-g`) against the **stock**
+`python3`, not DWARF against `python3-dbg`. Those two choices are inseparable:
+DWARF needs debug information that only the debug build carries, and `-g` on
+the debug build is actively broken, because the frame-pointer unwinder walks
+the allocator's `0xFD`/`0xDD` paint bytes and reports them as return addresses
+(section 1b of `results/raytrace_perf_baseline.txt`). Profiling the stock build
+removes the ~12% debug-allocator overhead, which is why perf now reports 1.59x
+for both benchmarks against pyperf's 1.60x and 1.61x, where the debug build
+read 1.54x. The cost is that Ubuntu compiles `python3` with
+`-fomit-frame-pointer`, so some stacks unwind into runs of unresolvable frames;
+those are collapsed to a single `[unresolved]` frame and account for 2.6–4.6%
+of self time.
+
 They show **C-level interpreter symbols, not Python function names.** CPython
 3.10 predates the `perf` trampoline support added in 3.12, so `perf` cannot
 attribute a sample to a Python function — it sees only the interpreter's own
