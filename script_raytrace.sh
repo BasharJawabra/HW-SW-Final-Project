@@ -200,11 +200,19 @@ stage_flamecmp() {
            "$RESULTS"/raytrace_optimized_flame.svg \
            "$RESULTS"/raytrace_diff_flame.svg
 
-    say "sample counts (proportional to elapsed time)"
-    printf 'baseline  : %s samples\n' \
-        "$(awk '{s+=$NF} END {print s}' "/tmp/$BASE_DIR.folded")"
-    printf 'optimized : %s samples\n' \
-        "$(awk '{s+=$NF} END {print s}' "/tmp/$OPT_DIR.folded")"
+    # stackcollapse-perf.pl sums the cpu-clock PERIOD, which for this
+    # event is nanoseconds of CPU time, not a count of samples. That is
+    # the more useful quantity here, but it has to be labelled correctly.
+    say "cpu-clock time attributed by the profiler"
+    local base_ns opt_ns
+    base_ns=$(awk '{s+=$NF} END {print s}' "/tmp/$BASE_DIR.folded")
+    opt_ns=$(awk '{s+=$NF} END {print s}' "/tmp/$OPT_DIR.folded")
+    awk -v b="$base_ns" -v o="$opt_ns" 'BEGIN {
+        printf "baseline  : %.3f s\n", b/1e9
+        printf "optimized : %.3f s\n", o/1e9
+        printf "ratio     : %.1f%% of baseline (%.2fx faster)\n", \
+               100*o/b, b/o
+    }'
 }
 
 
