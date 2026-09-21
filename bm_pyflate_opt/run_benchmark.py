@@ -449,15 +449,17 @@ def decode_huffman_block(b, out):
             buffer.append(o)
             pass
 
-    nt = nearly_there = bwt_reverse(b"".join(buffer), pointer)
+    nt = bwt_reverse(b"".join(buffer), pointer)
     i = 0
+    end = len(nt)
+    limit = end - 4
     # Pointless/irritating run-length encoding step
-    while i < len(nearly_there):
-        if i < len(nearly_there) - 4 and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
-            out.append(nearly_there[i:i + 1] * (ord(nearly_there[i + 4:i + 5]) + 4))
+    while i < end:
+        if i < limit and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+            out.append(nt[i:i + 1] * (nt[i + 4] + 4))
             i += 5
         else:
-            out.append(nearly_there[i:i + 1])
+            out.append(nt[i:i + 1])
             i += 1
 
 # Sixteen bits of magic have been removed by the time we start decoding
