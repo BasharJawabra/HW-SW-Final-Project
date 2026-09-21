@@ -42,18 +42,15 @@ class Vector(object):
             return Vector(self.x + other.x, self.y + other.y, self.z + other.z)
 
     def __sub__(self, other):
-        other.mustBeVector()
         return Vector(self.x - other.x, self.y - other.y, self.z - other.z)
 
     def scale(self, factor):
         return Vector(factor * self.x, factor * self.y, factor * self.z)
 
     def dot(self, other):
-        other.mustBeVector()
         return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
 
     def cross(self, other):
-        other.mustBeVector()
         return Vector(self.y * other.z - self.z * other.y,
                       self.z * other.x - self.x * other.z,
                       self.x * other.y - self.y * other.x)
@@ -107,7 +104,6 @@ class Point(object):
         return 'Point(%s,%s,%s)' % (self.x, self.y, self.z)
 
     def __add__(self, other):
-        other.mustBeVector()
         return Point(self.x + other.x, self.y + other.y, self.z + other.z)
 
     def __sub__(self, other):
