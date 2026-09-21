@@ -75,6 +75,7 @@ report_raytrace.txt   full write-up: analysis, optimizations, hardware decision
 report_pyflate.txt    full write-up: analysis, optimizations, hardware proposal
 script_raytrace.sh    reproduces every raytrace measurement
 script_pyflate.sh     reproduces every pyflate measurement and the simulation
+presentation_outline.md   talk structure and anticipated questions
 ```
 
 ### Profiling drivers
@@ -115,19 +116,44 @@ path.
 Every measurement is recorded at the time it was taken, one file per step.
 
 ```
+results/optimization_summary.txt          START HERE: both benchmarks, every
+                                          step, predicted vs measured
+
 results/raytrace_baseline.txt             timing and environment
 results/raytrace_cprofile_baseline.txt    hotspot analysis
 results/raytrace_perf_baseline.txt        perf profile, C-level
-results/raytrace_baseline_flame.svg       flame graph
 results/raytrace_opt1..3_comparison.txt   one per optimization
 
 results/pyflate_baseline.txt              timing and hotspot analysis
 results/pyflate_perf_baseline.txt         perf profile, C-level
-results/pyflate_baseline_flame.svg        flame graph
 results/pyflate_opt1..5_comparison.txt    one per optimization
 results/pyflate_accel_analysis.txt        speedup estimate for the hardware
 results/huffman_sim.txt                   accelerator verification
 ```
+
+Flame graphs, three per benchmark:
+
+```
+results/<name>_baseline_flame.svg         before
+results/<name>_optimized_flame.svg        after
+results/<name>_diff_flame.svg             differential
+```
+
+Regenerate with `./script_<name>.sh flamecmp`, which collects both profiles
+with identical parameters — a differential graph is only meaningful if the two
+sides differ by the optimizations rather than by the collection settings.
+
+In the differential graphs, width is time and colour is the change: **blue
+means time removed**, red means time added. The profiles are deliberately not
+normalized, so the blue area is real time deleted. Some red is expected — the
+length-indexed Huffman decode adds dictionary work even as it removes the table
+scan.
+
+Note that the flame graphs are collected under `python3-dbg` and their ratios
+are **not** the benchmark speedups: the debug allocator inflates the value of
+optimizations that work by not allocating, which makes raytrace look 1.79x
+there against 1.60x in reality. `results/optimization_summary.txt` explains
+this. Quote the `pyperf` numbers; treat the graphs as qualitative.
 
 Each `*_comparison.txt` records the change, the predicted gain, the measured
 gain, and the correctness evidence — including the cases where the prediction
