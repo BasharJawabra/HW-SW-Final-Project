@@ -1,0 +1,251 @@
+Optimization Summary - Both Benchmarks
+=======================================
+
+Date : 2026-09-21
+
+A single consolidated view of every optimization in the project: what
+was changed, what was predicted, what was measured, and how correctness
+was established. The per-step detail lives in the individual
+*_comparison.txt files; this is the reference to read first.
+
+All timings use the same pyperf configuration, -p 10 -w 1 -n 5, on the
+    10|same QEMU/KVM guest (Ubuntu 22.04.5, Python 3.10.12, pyperf 2.10.0).
+
+
+================================================================
+ HEADLINE
+================================================================
+
+    benchmark   baseline   optimized   speedup   reduction
+    ---------------------------------------------------------
+    raytrace      800 ms      498 ms     1.60x      37.8%
+    pyflate      1.12 sec     696 ms     1.61x      37.8%
+    20|
+Both measured end to end in a single session by the reproduction
+scripts, not assembled from the individual steps.
+
+Project requirement: >=7% on at least two benchmarks. Both clear it by
+more than five times over.
+
+
+================================================================
+ RAYTRACE - 3 OPTIMIZATIONS
+================================================================
+    30|
+    #  change                                time    step    cumul.
+    ------------------------------------------------------------------
+    -  baseline                             799 ms      -        -
+    1  hoist loop-invariant shadow ray      622 ms   22.2%    1.29x
+    2  remove no-op type assertions         573 ms    7.9%    1.40x
+    3  __slots__ on geometry classes        497 ms   13.3%    1.61x
+
+Prediction accuracy
+
+    40|    1  predicted 10-18%   measured 22.2%   underestimate
+    2  (no range recorded)  measured  7.9%
+    3  predicted  3-7%    measured 13.3%   underestimate
+
+Why #1 beat its prediction: the estimate assumed _lightIsVisible often
+returns early on the first occluder, so the redundant Ray construction
+would frequently not be paid. The realized 22.2% says the shadow test
+more often runs to completion - consistent with a scene where most
+visible surface points are lit by at least one of the two lights.
+
+    50|Why #3 beat its prediction: the estimate counted only the attribute
+access speedup. It missed that removing the per-instance __dict__ also
+removes an allocation per object, across 2,264,715 Vector constructions
+per 5 frames. The allocator saving was larger than the lookup saving.
+
+Common theme: NONE of the three optimizations touches the arithmetic.
+All three eliminate calls or allocations. This follows directly from
+the profile - 3.1 million Python calls per 100x100 frame, with ~10.9%
+of perf self time in frame setup and teardown alone.
+
+    60|Correctness
+
+    Raytrace does not verify its own output, so every step was checked
+    by rendering a frame from both variants and comparing raw pixels.
+
+        f3c700588a9b6320fb1e46027142f205  raytrace_base.ppm
+        f3c700588a9b6320fb1e46027142f205  raytrace_opt.ppm
+
+    Byte-identical, not approximately equal. No change reassociates
+    floating-point arithmetic, so any difference would be a bug rather
+    70|    than drift. The same hash was independently reproduced on macOS
+    and inside the VM.
+
+
+================================================================
+ PYFLATE - 5 OPTIMIZATIONS
+================================================================
+
+    #  change                                time    step    cumul.
+    ------------------------------------------------------------------
+    -  baseline                            1.11 s       -        -
+    80|    1  inline the _mask bit-mask helper     1.04 s     6.3%    1.07x
+    2  rewrite move_to_front                865 ms   16.8%    1.29x
+    3  length-indexed huffman decode        799 ms    7.6%    1.39x
+    4  hoist RLE loop length checks         738 ms    7.6%    1.50x
+    5  batch literal spans                  690 ms    6.5%    1.61x
+
+Prediction accuracy
+
+    1  predicted  5.9%    measured  6.3%   close
+    2  predicted  4-8%    measured 16.8%   large underestimate
+    90|    3  predicted 15-25%   measured  7.6%   large overestimate
+    4  predicted  3-6%    measured  7.6%   slight underestimate
+    5  predicted 5-12%    measured  6.5%   low end of range
+
+The two large misses are the most instructive results in the project.
+
+#2 underestimated because the prediction used move_to_front's own self
+time. The slice rebuild creates three temporary lists per call, and the
+allocator and garbage collection work that follows is attributed by
+cProfile to no single function - it surfaces only in the perf profile,
+   100|as list_dealloc and _PyObject_Malloc. The biggest win of the five came
+from the change whose cost was the most diffuse.
+
+#3 overestimated because 49% was find_next_symbol's CUMULATIVE time,
+which includes the snoopbits and readbits calls it makes. The new
+implementation removes the table scan but still performs the bit
+reading. The figure that mattered was its SELF time, 15.5%, and the
+realized 7.6% sits sensibly below that.
+
+That distinction is exactly why the hardware proposal targets the bit
+   110|reader and the symbol decode TOGETHER. In software they are separate
+functions with separate costs; in hardware they are one operation.
+
+Correctness
+
+    The benchmark self-verifies: bench_pyflake raises on an MD5
+    mismatch, so every timing quoted came from a correct run.
+
+    That is necessary but not sufficient. The bundled data is bzip2,
+    which only ever decodes with reversed=False, so the DEFLATE path
+    (reversed=True) is never exercised and a wrong answer there would
+   120|    pass silently. tests/test_huffman_equivalence.py closes the gap:
+
+        compared 24000 decode attempts across both directions
+        no mismatches
+
+
+================================================================
+ CONSIDERED AND DELIBERATELY NOT DONE
+================================================================
+
+raytrace
+   130|    Vector.normalized calls magnitude() then scale(), paying an extra
+    call and an intermediate allocation across 549,435 invocations.
+    Sphere.intersectionTime repeats attribute lookups that could be
+    bound to locals once.
+
+pyflate
+    bwt_transform computes character counts by sorting the whole block
+    and then performing 256 bytes.find calls - its own comment calls
+    this "semi-inefficient". A 256-bin histogram plus a prefix sum is
+    O(n + 256) with no sort. Worth 0.103 s cumulative in the baseline,
+   140|    against changes delivering several times that elsewhere.
+
+All three are real. They are recorded rather than implemented because
+an optimization that is measured and documented is worth more than one
+that is merely applied, and the target was already exceeded.
+
+
+================================================================
+ FLAME GRAPHS
+================================================================
+
+   150|    results/raytrace_baseline_flame.svg
+    results/raytrace_optimized_flame.svg
+    results/raytrace_diff_flame.svg
+    results/pyflate_baseline_flame.svg
+    results/pyflate_optimized_flame.svg
+    results/pyflate_diff_flame.svg
+
+Regenerate with:  ./script_<name>.sh flamecmp
+
+Reading the differential graphs
+   160|
+    Width is time; colour is the change between baseline and optimized.
+    BLUE means time was removed, RED means time was added.
+
+    The two profiles are collected with identical parameters - same
+    loop count, same sampling frequency - because otherwise the
+    difference between them would reflect the collection settings
+    rather than the optimizations. This is why the flamecmp stage
+    regenerates the baseline instead of reusing an older one.
+
+   170|    The profiles are deliberately NOT normalized. perf samples on a
+    timer at fixed frequency, so the totals are proportional to elapsed
+    time and the blue area represents real time deleted rather than a
+    mere change in shape.
+
+    Some red is expected and is not a defect. The length-indexed
+    Huffman decode ADDS dictionary work even as it removes the table
+    scan, so parts of the decode path legitimately got more expensive
+    while the whole got substantially cheaper.
+
+   180|
+================================================================
+ WHY THE FLAME GRAPH RATIOS DIFFER FROM THE HEADLINE SPEEDUPS
+================================================================
+
+This needs stating explicitly, because the two sets of numbers look
+like they disagree.
+
+    benchmark   under python3-dbg      under python3 (pyperf)
+    ---------------------------------------------------------------
+   190|    pyflate     6.362 -> 4.057 s      1.61x
+                = 1.57x
+    raytrace    6.460 -> 3.604 s      1.60x
+                = 1.79x
+
+Flame graphs must be collected with python3-dbg, because the stock
+interpreter is stripped and DWARF unwinding needs its debug
+information. But the debug build writes guard bytes around every
+allocation and re-validates them on free - the _PyMem_DebugCheckAddress
+/ read_size_t / write_size_t entries that account for roughly 12% of
+   200|the profile.
+
+That inflates the value of any optimization which works by NOT
+allocating. Two of raytrace's three changes do exactly that: __slots__
+deletes the per-instance __dict__ for millions of Vectors, and the
+shadow-ray hoist deletes whole subtrees of temporary objects. So the
+debug interpreter flatters them, and raytrace appears 1.79x faster
+there against 1.60x in reality.
+
+pyflate shows no such gap (1.57x against 1.61x) because its wins are
+   210|more mixed - the length-indexed decode adds dictionary work as it
+removes the scan, so it gains less from cheaper allocation.
+
+Conclusion: the flame graphs are a valid picture of WHERE time went and
+WHAT was removed. They are not a measurement of the speedup. Quote
+1.60x and 1.61x from pyperf; treat the graphs as qualitative.
+
+
+================================================================
+ WHAT THE MEASUREMENTS REVEALED BEYOND THE SPEEDUPS
+================================================================
+   220|
+1. Raytrace is bottlenecked on CALLING functions, not on the work the
+   functions do. 3.1 million Python calls per frame; ~10.9% of perf
+   self time in frame allocation and teardown. All three optimizations
+   eliminate calls; none improves the arithmetic.
+
+2. Pyflate's Huffman decode share ROSE after being optimized, from
+   49.3% to about 50.1%, because the other four optimizations removed
+   proportionally more from everything else. Amdahl's law read in
+   reverse.
+   230|
+3. Point 2 is what identified the hardware target. The component worth
+   accelerating is the one that SURVIVED a serious software effort, not
+   the one that merely looked expensive before anyone tried.
+
+4. Point 1 is what ruled raytrace out as a hardware target, despite it
+   being the workload that superficially looks ideal for a MAC unit.
+   Accelerating arithmetic cannot help a program whose cost is the
+   interpretation of that arithmetic.
+
+   240|Both conclusions come from the same pair of profiles. Profiling
+answers not only where the time goes but what kind of work it is, and
+the second question is the one that determines whether hardware helps.
