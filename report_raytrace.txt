@@ -1,0 +1,501 @@
+================================================================================
+ REPORT: RAYTRACE
+ Benchmark optimization, analysis, and hardware acceleration
+================================================================================
+
+ Author  : Khaled Khamaisy
+ Date    : 2026-09-21
+ Repo    : https://github.com/BasharJawabra/HW-SW-Final-Project
+
+ Result  : 1.60x faster (800 ms -> 498 ms), output byte-identical to
+           the pristine benchmark.
+
+ Supporting files
+   results/raytrace_baseline.txt            baseline timing
+   results/raytrace_cprofile_baseline.txt   hotspot analysis
+   results/raytrace_perf_baseline.txt       perf profile
+   results/raytrace_baseline_flame.svg      flame graph
+   results/raytrace_opt1..3_comparison.txt  one file per optimization
+   profile_raytrace.py                      profiling driver
+   script_raytrace.sh                       reproduces all of the above
+
+
+================================================================================
+ 1. OVERVIEW
+================================================================================
+
+1.1 What the benchmark is
+-------------------------
+
+Raytrace is a pyperformance benchmark that renders a 100x100 image of a
+small scene by ray tracing. For every pixel it casts a primary ray,
+finds the nearest intersecting object, and shades the hit point by
+testing visibility to each light source.
+
+Like pyflate, it is pure Python with no numerical library underneath.
+Its cost is not floating-point arithmetic but the interpreter overhead
+of performing that arithmetic through Python objects and method calls -
+a distinction that turns out to decide both the software optimizations
+and the hardware discussion in section 5.
+
+
+1.2 Libraries used
+------------------
+
+    math     sqrt, in Vector.magnitude
+    pyperf   the measurement harness, not part of the workload
+
+That is the entire dependency list of the measured path. There is no
+numpy and no C extension, so vectorizing the arithmetic by swapping in
+a library is not available; every improvement must come from changing
+how the Python is written.
+
+
+1.3 Data structures and algorithm
+---------------------------------
+
+  Vector      3 floats, with dot, cross, scale, magnitude, normalized,
+              reflectThrough and arithmetic operators
+  Point       3 floats, subtracting to a Vector
+  Ray         a Point and a normalized direction Vector
+  Sphere      a centre Point and a radius
+  Halfspace   a Point and a normal Vector
+  Canvas      the output bitmap, written with plot()
+  Scene       the object list, the light list, and the render loop
+
+Per pixel:
+
+    Scene.render
+      Scene.rayColour
+        firstIntersection over all objects
+          Sphere.intersectionTime / Halfspace.intersectionTime
+        SimpleSurface.colourAt  or  CheckerboardSurface
+          Scene.visibleLights
+            Scene._lightIsVisible      <- shadow ray test, per light
+              intersectionTime over all objects
+
+The nesting matters: the shadow test at the bottom runs for every light
+at every shaded point, and inside it loops over every object in the
+scene. That is where the time goes.
+
+
+1.4 Correctness has to be checked externally
+--------------------------------------------
+
+Unlike pyflate, raytrace does not verify its own output. A subtly
+broken renderer produces a wrong picture quickly and says nothing.
+
+Every optimization here is therefore validated by rendering a frame
+from both variants and comparing the raw pixels:
+
+    python3 profile_raytrace.py --variant bm_raytrace     --ppm base.ppm
+    python3 profile_raytrace.py --variant bm_raytrace_opt --ppm opt.ppm
+    md5sum base.ppm opt.ppm
+
+The --ppm option was added to profile_raytrace.py for exactly this
+purpose. The expectation is byte-for-byte identity, not approximate
+agreement: none of the three optimizations reassociates arithmetic, so
+any difference at all would indicate a genuine bug rather than
+floating-point drift.
+
+
+================================================================================
+ 2. INITIAL ANALYSIS
+================================================================================
+
+2.1 Environment
+---------------
+
+    QEMU/KVM guest, Ubuntu 22.04.5, kernel 5.15.0-1106-kvm
+    Python 3.10.12, pyperf 2.10.0
+    perf 5.15.209, python3-dbg 3.10.12
+
+    pyperf configuration, identical across the whole project:
+        -p 10 -w 1 -n 5
+
+
+2.2 Baseline
+------------
+
+    python3 bm_raytrace/run_benchmark.py -o raytrace_baseline.json \
+        -p 10 -w 1 -n 5
+
+    raytrace: Mean +- std dev: 799 ms +- 4 ms
+
+Relative standard deviation ~0.5%. A saving of 56 ms (7%) is
+comfortably measurable; anything under ~12 ms (3 sigma) is noise.
+
+
+2.3 Why a custom profiling driver was needed
+--------------------------------------------
+
+pyperf forks a fresh worker process for every measured value, which
+scatters perf samples across short-lived children and makes attribution
+nearly impossible. profile_raytrace.py runs the identical render
+workload in one long-lived process, and supports both a plain mode for
+perf to wrap and a --cprofile mode.
+
+It also takes --variant, so the pristine and optimized copies are
+profiled through an identical harness rather than through two
+subtly different scripts.
+
+
+2.4 cProfile hotspots
+---------------------
+
+    python3 profile_raytrace.py --loops 5 --cprofile
+
+    15,431,530 function calls in 9.680 s over 5 renders
+    => ~3.1 million Python function calls per 100x100 frame
+
+cProfile inflates runtime about 2.5x versus the uninstrumented 787.7 ms
+per render, so the absolute times are not comparable to pyperf. The
+ranking and the call counts are what matter, and call counts are exact.
+
+    ncalls    tottime  cumtime  function
+    2549355     1.635    1.975  Vector.dot
+    1389325     1.369    2.080  Point.__sub__
+     897285     1.151    3.865  Sphere.intersectionTime
+    2264715     0.834    0.834  Vector.__init__
+      53330     0.616    4.489  Scene._lightIsVisible
+     748715     0.472    0.751  Vector.scale
+     549435     0.403    1.831  Vector.normalized
+     549435     0.364    0.883  Vector.magnitude
+    2602695     0.348    0.348  Vector.mustBeVector
+      76325     0.329    2.739  rayColour intersections listcomp
+     490860     0.299    1.936  Ray.__init__
+      26665     0.245    6.638  SimpleSurface.colourAt
+    1389325     0.201    0.201  Point.isPoint
+     584105     0.085    0.085  math.sqrt
+
+Three million function calls to render ten thousand pixels is the
+headline. The arithmetic itself is trivial - 584,105 calls to
+math.sqrt is the only transcendental work in the entire frame.
+
+
+2.5 perf profile and flame graph
+--------------------------------
+
+Collected with cpu-clock (the QEMU guest exposes no PMU, so the
+hardware cycles event yields zero samples) and DWARF unwinding (the
+frame-pointer unwinder on python3-dbg reports debug-allocator fill
+bytes 0xFD and 0xDD as return addresses, producing a meaningless
+graph). Full detail in results/raytrace_perf_baseline.txt.
+
+    28.55%  28.54%  _PyEval_EvalFrameDefault
+     3.45%   3.44%  call_function
+     3.38%   1.13%  _PyFrame_New_NoTrack
+     3.37%   3.37%  frame_dealloc
+     2.99%   2.99%  _PyEval_MakeFrameVector
+
+Excluding the bytecode dispatch loop, which is expected to lead any
+pure-Python profile and is not actionable by itself, the cluster below
+it is:
+
+    call_function            3.44%
+    frame_dealloc            3.37%
+    _PyEval_MakeFrameVector  2.99%
+    _PyFrame_New_NoTrack     1.13%
+    -----------------------------------
+    ~10.9% of self time in call and frame machinery
+
+This is the cost of entering and leaving Python functions: allocating a
+frame object, building its locals vector, destroying it. It is pure
+overhead with respect to the raytracing.
+
+perf and cProfile answer different questions and agree. cProfile says
+which functions generate 3.1 million calls per frame; perf says a large
+share of time is spent setting up and tearing down those calls.
+
+The conclusion that drove the entire optimization plan follows directly:
+the changes worth making are the ones that ELIMINATE CALLS, not the
+ones that make individual calls cheaper.
+
+
+================================================================================
+ 3. OPTIMIZATIONS
+================================================================================
+
+bm_raytrace_opt/ began as a byte-identical copy of bm_raytrace/. Each
+optimization is one commit, measured in isolation, with the rendered
+output compared byte-for-byte against the pristine benchmark.
+
+
+3.1 Hoist the loop-invariant shadow ray                  22.2%  (1.29x)
+-----------------------------------------------------------------------
+
+    def _lightIsVisible(self, l, p):
+    -     for (o, s) in self.objects:
+    -         t = o.intersectionTime(Ray(p, l - p))
+    +     shadowRay = Ray(p, l - p)
+    +     for (o, s) in self.objects:
+    +         t = o.intersectionTime(shadowRay)
+              if t is not None and t > EPSILON:
+                  return False
+          return True
+
+Ray(p, l - p) depends only on l and p, neither of which changes across
+the loop. With 8 objects in the scene the identical Ray was being
+constructed up to 8 times per call.
+
+The cost is not one allocation. Ray.__init__ normalizes its direction,
+so each redundant construction pays a Point.__sub__, a
+Vector.normalized, and inside that a Vector.magnitude, a math.sqrt and
+a Vector.scale that allocates yet another Vector. One hoisted line
+removes an entire subtree of calls.
+
+The _lightIsVisible subtree accounted for 4.557 s of 9.680 s - about
+47% of instrumented runtime - so this was the obvious first target.
+
+    799 ms -> 622 ms
+
+Correctness: the loop body neither mutates the Ray nor depends on
+iteration order for its value, so the transformation is arithmetically
+exact rather than an approximation. Output byte-identical.
+
+Note on the measured gain: the saving is less than the object count
+suggests, because _lightIsVisible returns early on the first occluder
+and shadowed points often exit after a single iteration. The redundant
+construction only happens on the iterations that actually run.
+
+
+3.2 Remove no-op type assertions                          7.9%  (1.09x)
+-----------------------------------------------------------------------
+
+Deleted calls to other.mustBeVector() from Vector.__sub__, Vector.dot,
+Vector.cross and Point.__add__.
+
+Vector.mustBeVector is called 2,602,695 times per 5 frames and its
+entire body is `return self`. Point.isPoint is called 1,389,325 times
+to return a constant. Together that is ~4.0 million function calls
+whose only effect is to confirm a type the code already guarantees by
+construction.
+
+They sit on the hottest paths in the program: Vector.dot invokes
+mustBeVector on every one of its 2,549,355 calls.
+
+    622 ms -> 573 ms   (cumulative 1.40x)
+
+This is precisely the change the perf profile predicted would pay:
+removing 4 million calls attacks the frame setup and teardown cluster
+directly. Output byte-identical.
+
+
+3.3 Add __slots__ to the geometry classes                13.3%  (1.15x)
+-----------------------------------------------------------------------
+
+    class Vector(object):
+        __slots__ = ('x', 'y', 'z')
+
+applied to Vector, Point, Ray, Sphere and Halfspace.
+
+Without __slots__ every instance carries a full __dict__, so each
+attribute read is a dictionary lookup and each instance costs a
+separate dict allocation. Vector.__init__ runs 2,264,715 times per 5
+frames, and Vector.dot performs six attribute reads per call across
+2,549,355 calls.
+
+__slots__ replaces the per-instance dictionary with fixed offsets:
+attribute access becomes an array index, and instances become
+substantially smaller, which also reduces allocator pressure.
+
+    573 ms -> 497 ms   (cumulative 1.61x)
+
+Correctness: verified with a stubbed pyperf module rendering a 40x40
+frame from both variants, producing identical MD5 digests
+(4ef68b004bdcdfd7eebebef12e238c9c). __slots__ changes object layout,
+not semantics, provided no code assigns attributes outside the declared
+set - which was checked across the module.
+
+
+3.4 Identified and not done
+---------------------------
+
+Two further opportunities were found in the baseline analysis and
+deliberately left:
+
+  Vector.normalized calls magnitude() then scale(), allocating an
+  intermediate and paying an extra Python-level call per invocation
+  across 549,435 calls. Computing the reciprocal once and constructing
+  the result Vector directly would remove one call and one allocation
+  each time.
+
+  Sphere.intersectionTime repeats attribute lookups that could be bound
+  to locals once.
+
+Both are real. Neither was implemented because the project's threshold
+was already exceeded by a wide margin, and an optimization that is
+measured and documented is worth more than one that is merely applied.
+They are recorded here so the remaining headroom is visible rather than
+implied.
+
+
+================================================================================
+ 4. PERFORMANCE COMPARISON
+================================================================================
+
+Step by step, each measured against the state before it:
+
+    stage   time     change                                 saving
+    ---------------------------------------------------------------
+    base    799 ms   -                                         -
+    opt1    622 ms   hoist loop-invariant shadow ray        22.2%
+    opt2    573 ms   remove no-op type assertions            7.9%
+    opt3    497 ms   __slots__ on geometry classes          13.3%
+
+End to end, measured in a single session by script_raytrace.sh:
+
+    +-----------+-------------------+----------------------+
+    | Benchmark | raytrace_baseline | raytrace_optimized   |
+    +===========+===================+======================+
+    | raytrace  | 800 ms            | 498 ms: 1.60x faster |
+    +-----------+-------------------+----------------------+
+
+    output equivalence
+    f3c700588a9b6320fb1e46027142f205  /tmp/raytrace_base.ppm
+    f3c700588a9b6320fb1e46027142f205  /tmp/raytrace_opt.ppm
+    IDENTICAL: optimized output matches the baseline exactly
+
+Two remarks on the measurement.
+
+The end-to-end 1.60x agrees with the 1.61x obtained by compounding the
+three individual steps. Incremental measurements taken on different
+days under different load can drift from reality, so confirming the
+product against a single-session run is worth the extra minutes.
+
+pyperf flagged the optimized run as not fully stable ("not enough
+samples to get a stable result"). At 498 ms +- 7 ms that is ~1.4%
+relative deviation, far too small to threaten a 1.60x result, but it is
+reported rather than omitted. Tightening it would need more values per
+process or a quieter host, neither of which would change the
+conclusion.
+
+Target: the project requires >=7% on at least two benchmarks.
+Delivered: raytrace 37.8% reduction, pyflate 37.8% reduction.
+
+
+================================================================================
+ 5. HARDWARE ACCELERATION: ANALYSIS AND DECISION
+================================================================================
+
+The RTL implementation in this project is the Huffman decoder for
+pyflate, documented in report_pyflate.txt. This section explains what
+was considered for raytrace and why the effort went elsewhere, because
+the reasoning is a result in its own right.
+
+
+5.1 The obvious candidate
+-------------------------
+
+Ray tracing is the standard example of an embarrassingly parallel
+floating-point workload, and the profile appears to invite a
+vector-arithmetic accelerator or an ISA extension:
+
+    Vector.dot               2,549,355 calls   3 multiplies, 2 adds
+    Point.__sub__            1,389,325 calls   3 subtracts
+    Sphere.intersectionTime    897,285 calls   a quadratic solve
+    math.sqrt                  584,105 calls
+
+A fused multiply-accumulate unit, or a dot-product instruction of the
+kind the project brief suggests, maps onto this perfectly. Real GPUs
+exist precisely because this workload suits fixed-function hardware.
+
+
+5.2 Why it would not help here
+-------------------------------
+
+The arithmetic is not the bottleneck. The interpretation of the
+arithmetic is.
+
+Consider Vector.dot. Its body is three multiplies and two adds -
+roughly five floating-point operations, a handful of nanoseconds on any
+modern core, and already executed by the CPU's existing FPU. What costs
+2,549,355 x (frame allocation + locals vector construction + six
+dictionary or slot lookups + frame teardown) is everything AROUND those
+five operations.
+
+perf quantified this directly: ~10.9% of self time in call_function,
+frame_dealloc, _PyEval_MakeFrameVector and _PyFrame_New_NoTrack, with
+_PyEval_EvalFrameDefault - bytecode dispatch - at 28.54% on top.
+
+A perfect dot-product accelerator would eliminate the five arithmetic
+operations and none of the surrounding overhead. Worse, invoking it
+from CPython would require a call through the C API, which costs more
+than the multiplies it replaces. The accelerator would make the program
+slower.
+
+This is not a marginal judgement. The three software optimizations that
+delivered 1.60x contain no arithmetic improvements whatsoever. Every one
+of them removes CALLS: a hoisted construction, deleted no-op methods,
+and a change of object layout. The benchmark responded to call
+elimination and would not have responded to faster floating point.
+
+
+5.3 What would actually be needed
+----------------------------------
+
+To make raytrace amenable to arithmetic acceleration, the Python-level
+call structure would have to be dismantled first - by tracing JIT,
+by ahead-of-time compilation of the vector classes, or by restructuring
+the program around bulk array operations so that one call performs
+thousands of arithmetic operations instead of five.
+
+That is a compiler and runtime problem, not a hardware one. Only after
+it is solved does the arithmetic become a large enough fraction for an
+accelerator to matter, and at that point the appropriate hardware is a
+conventional SIMD unit or GPU rather than anything custom.
+
+By contrast, pyflate's Huffman decode is a good hardware candidate for
+the opposite reason: its cost is intrinsic to sequential, bit-serial
+searching that general-purpose hardware handles badly and dedicated
+hardware handles in one cycle. The work being replaced is real
+algorithmic work, not interpreter overhead.
+
+
+5.4 Amdahl's law, for completeness
+-----------------------------------
+
+Even granting a free arithmetic unit and ignoring the call overhead
+above, the ceiling is modest. Summing the self time of the pure
+arithmetic leaves (Vector.dot, Vector.__init__, Vector.scale,
+Vector.magnitude, math.sqrt, Vector.__add__) gives roughly 3.4 s of the
+9.680 s instrumented profile, and most of that is call machinery rather
+than the operations themselves. Assuming, generously, that a third of
+it is genuine arithmetic:
+
+    f ~ 0.12    =>    max speedup 1/(1 - 0.12) = 1.14x
+
+against a software change costing three lines that delivered 1.29x on
+its own. The comparison is not close, and it is the reason this report
+recommends against building the accelerator rather than proposing one
+that would look impressive and accomplish little.
+
+
+================================================================================
+ 6. CONCLUSION
+================================================================================
+
+Three optimizations made raytrace 1.60x faster, 800 ms to 498 ms, with
+output byte-identical to the pristine benchmark on every measurement.
+
+What makes the result interesting is that none of the three touched the
+arithmetic. Profiling showed 3.1 million Python function calls per
+100x100 frame, and perf showed roughly 11% of self time going into
+frame setup and teardown alone. The program was bottlenecked on the
+cost of calling functions, not on the work those functions did, so the
+optimizations that paid were a hoisted loop invariant, the deletion of
+4 million no-op assertions, and a change of object layout - three
+different ways of not calling a function.
+
+That finding also settled the hardware question. Raytrace looks like
+the ideal accelerator target and is not one: a dot-product unit would
+remove five floating-point operations per call while leaving the
+interpreter overhead that dominates, and the C API call needed to reach
+it would cost more than the arithmetic it replaced. The hardware effort
+went to pyflate's Huffman decoder instead, where the cost being removed
+is genuine sequential algorithmic work rather than an artifact of how
+the program is executed.
+
+The general lesson is that profiling tells you not only where the time
+goes but what KIND of work it is, and the second question is the one
+that determines whether hardware can help.
