@@ -90,12 +90,12 @@ class Bitfield(BitfieldBase):
     def snoopbits(self, n=8):
         if n > self.bits:
             self.needbits(n)
-        return self.bitfield & self._mask(n)
+        return self.bitfield & ((1 << n) - 1)
 
     def readbits(self, n=8):
         if n > self.bits:
             self.needbits(n)
-        r = self.bitfield & self._mask(n)
+        r = self.bitfield & ((1 << n) - 1)
         self.bits -= n
         self.bitfield >>= n
         return r
@@ -112,14 +112,15 @@ class RBitfield(BitfieldBase):
     def snoopbits(self, n=8):
         if n > self.bits:
             self.needbits(n)
-        return (self.bitfield >> (self.bits - n)) & self._mask(n)
+        return (self.bitfield >> (self.bits - n)) & ((1 << n) - 1)
 
     def readbits(self, n=8):
         if n > self.bits:
             self.needbits(n)
-        r = (self.bitfield >> (self.bits - n)) & self._mask(n)
+        mask = (1 << n) - 1
+        r = (self.bitfield >> (self.bits - n)) & mask
         self.bits -= n
-        self.bitfield &= ~(self._mask(n) << self.bits)
+        self.bitfield &= ~(mask << self.bits)
         return r
 
 
