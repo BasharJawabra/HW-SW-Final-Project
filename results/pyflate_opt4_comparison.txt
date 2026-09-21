@@ -1,0 +1,116 @@
+Pyflate Optimization 4: Hoist Length Checks Out of the RLE Loop
+===============================================================
+
+Date   : 2026-09-21
+Commit : f80ce06
+File   : bm_pyflate_opt/run_benchmark.py
+Target : the final run-length expansion in decode_huffman_block
+
+
+The change
+----------
+
+Before:
+
+    nt = nearly_there = bwt_reverse(b"".join(buffer), pointer)
+    i = 0
+    while i < len(nearly_there):
+        if i < len(nearly_there) - 4 and \
+           nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+            out.append(nearly_there[i:i + 1] *
+                       (ord(nearly_there[i + 4:i + 5]) + 4))
+            i += 5
+        else:
+            out.append(nearly_there[i:i + 1])
+            i += 1
+
+After:
+
+    nt = bwt_reverse(b"".join(buffer), pointer)
+    i = 0
+    end = len(nt)
+    limit = end - 4
+    while i < end:
+        if i < limit and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+            out.append(nt[i:i + 1] * (nt[i + 4] + 4))
+            i += 5
+        else:
+            out.append(nt[i:i + 1])
+            i += 1
+
+
+Rationale
+---------
+
+Three independent inefficiencies, all in the hottest remaining loop
+(decode_huffman_block held the largest self time in the profile at
+0.488 s):
+
+  1. len(nearly_there) was recomputed on every iteration, and a second
+     time inside the condition. nt is an immutable bytes object whose
+     length cannot change during the loop, so both are loop-invariant.
+     cProfile counted 674,570 len calls overall.
+
+  2. ord(nearly_there[i + 4:i + 5]) allocated a one-byte slice and
+     called ord on it, where indexing a bytes object already yields the
+     integer directly. Verified equivalent for all 256 byte values:
+
+         all(ord(b[i:i+1]) == b[i] for i in range(256))  ->  True
+
+     This removed 76,108 ord calls plus the same number of slice
+     allocations.
+
+  3. The redundant alias "nt = nearly_there = ..." bound two names to
+     the same object, and the loop used them interchangeably for no
+     reason. nearly_there is unused after the loop, so the alias was
+     dropped.
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    opt3 (huffman lookup) : 799 ms +- 7 ms
+    opt4 (this change)    : 738 ms +- 6 ms
+
+Isolated contribution:
+
+    python3 -m pyperf compare_to \
+        results/pyflate_opt3.json results/pyflate_opt4.json
+    => 1.08x faster, 7.6% reduction
+
+Cumulative against the original baseline:
+
+    1.11 sec -> 738 ms: 1.504x faster
+    ~372 ms saved, 33.5% reduction
+
+
+Correctness
+-----------
+
+bench_pyflake's internal MD5 assertion passed, both on the development
+machine and in the benchmark VM.
+
+
+Estimate versus result
+----------------------
+
+Predicted 3-6%; measured 7.6%. This estimate was built from self time
+rather than cumulative time, following the correction recorded in
+results/pyflate_opt3_comparison.txt, and came much closer than the
+previous one. The slight underestimate is attributable to the slice
+allocations removed alongside the ord calls, which do not appear as a
+separate line in the profile.
+
+
+Cumulative progress
+-------------------
+
+    baseline  1.11 sec         --
+    opt1      1.04 sec         inline the bit-mask helper
+    opt2      865 ms           rewrite move_to_front
+    opt3      799 ms           length-indexed huffman decode
+    opt4      738 ms           hoist length checks in the RLE loop
+
+    Total: 1.504x faster, 33.5% reduction, MD5 gate passing throughout.
