@@ -236,6 +236,15 @@ stage_pyflame() {
         return 1
     fi
 
+    local fg
+    fg="$(dirname "$(find "$HOME" -name flamegraph.pl 2>/dev/null | head -1)")"
+    if [ ! -x "$fg/flamegraph.pl" ]; then
+        echo "FlameGraph not found; run '$0 setup' first" >&2
+        return 1
+    fi
+
+    local loops=5 rate=200
+
     local variant label
     for variant in "$BASE_DIR" "$OPT_DIR"; do
         case "$variant" in
@@ -243,14 +252,43 @@ stage_pyflame() {
             *)     label=baseline ;;
         esac
         echo "--- $variant ---"
+
+        # --format raw emits folded stacks rather than py-spy's own SVG,
+        # so these graphs go through the same flamegraph.pl as the perf
+        # ones. Two reasons that matters: py-spy's built-in renderer
+        # draws an ICICLE graph (root at the top, growing downward),
+        # whereas flamegraph.pl draws the conventional bottom-up flame
+        # graph, and flamegraph.pl accepts a real --title.
+        #
         # No --subprocesses: the driver runs in a single process, and
         # py-spy fails with "No child process" trying to reap a child
         # that has already exited.
-        py-spy record --format flamegraph --rate 200 \
-            --output "$RESULTS/pyflate_${label}_python_flame.svg" \
+        py-spy record --format raw --rate "$rate" \
+            --output "/tmp/${variant}.pyfolded" \
             -- python3 "$REPO/profile_pyflate.py" \
-                  --variant "$variant" --loops 5
+                  --variant "$variant" --loops "$loops"
+
+        # py-spy roots every stack at 'process <pid>:"<full command>"'.
+        # That frame is a whole command line wide, so it squashes the
+        # real root to nothing, and it embeds a PID that changes every
+        # run, which makes the committed SVGs differ on content that
+        # carries no information. Drop it and let the driver's <module>
+        # frame be the root.
+        sed -i -e 's/^process [0-9]*:"[^"]*";//' -e 's/^all;//' \
+            "/tmp/${variant}.pyfolded"
     done
+
+    "$fg/flamegraph.pl" \
+        --title "pyflate BASELINE - Python level (py-spy, ${rate} Hz)" \
+        --subtitle "${loops} decompressions on python3; every frame is a benchmark function" \
+        "/tmp/$BASE_DIR.pyfolded" \
+        > "$RESULTS/pyflate_baseline_python_flame.svg"
+
+    "$fg/flamegraph.pl" \
+        --title "pyflate OPTIMIZED - Python level (py-spy, ${rate} Hz)" \
+        --subtitle "${loops} decompressions on python3; every frame is a benchmark function" \
+        "/tmp/$OPT_DIR.pyfolded" \
+        > "$RESULTS/pyflate_optimized_python_flame.svg"
 
     echo
     ls -la "$RESULTS"/pyflate_*_python_flame.svg
