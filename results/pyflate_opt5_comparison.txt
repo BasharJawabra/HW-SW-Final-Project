@@ -1,0 +1,137 @@
+Pyflate Optimization 5: Batch Literal Spans in the RLE Loop
+===========================================================
+
+Date   : 2026-09-21
+Commit : ea11d13
+File   : bm_pyflate_opt/run_benchmark.py
+Target : the final run-length expansion in decode_huffman_block
+
+
+The change
+----------
+
+Before, one bytes object appended per literal character:
+
+    while i < end:
+        if i < limit and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+            out.append(nt[i:i + 1] * (nt[i + 4] + 4))
+            i += 5
+        else:
+            out.append(nt[i:i + 1])
+            i += 1
+
+After, one bytes object per literal SPAN:
+
+    append = out.append
+    literal_start = 0
+    while i < end:
+        if i < limit and nt[i] == nt[i + 1] == nt[i + 2] == nt[i + 3]:
+            if literal_start != i:
+                append(nt[literal_start:i])
+            append(nt[i:i + 1] * (nt[i + 4] + 4))
+            i += 5
+            literal_start = i
+        else:
+            i += 1
+    if literal_start != end:
+        append(nt[literal_start:end])
+
+
+Rationale
+---------
+
+cProfile counted 766,811 list.append calls, the large majority of them
+appending a freshly allocated one-byte slice from this loop. Each
+literal character therefore cost a slice allocation, a method call and
+a list growth check.
+
+Because bzip2_main consumes the accumulated list with
+
+    return b''.join(out)
+
+only the concatenation is observable, not how it was chunked. Appending
+nt[literal_start:i] once is byte-for-byte equivalent to appending each
+nt[j:j+1] for j in that range, so literals can be batched freely.
+
+Two supporting details:
+
+  - The trailing flush after the loop handles the common case where the
+    block ends with literals rather than with a run; without it the
+    final span would be silently dropped.
+
+  - out.append is bound to a local name, removing an attribute lookup
+    per iteration.
+
+Secondary benefit: b''.join walks a much shorter list, and each element
+it copies is larger, which is the access pattern join is optimized for.
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    opt4 (RLE length hoisting) : 738 ms +- 6 ms
+    opt5 (this change)         : 690 ms +- 4 ms
+
+Isolated contribution:
+
+    python3 -m pyperf compare_to \
+        results/pyflate_opt4.json results/pyflate_opt5.json
+    => 1.07x faster, 6.5% reduction
+
+Cumulative against the original baseline:
+
+    1.11 sec -> 690 ms: 1.609x faster
+    ~420 ms saved, 37.8% reduction
+
+
+Correctness
+-----------
+
+bench_pyflake's internal MD5 assertion passed on the development
+machine and in the benchmark VM. The trailing-flush path is exercised by
+the test data, since dropping it produces a checksum mismatch.
+
+
+Estimate versus result
+----------------------
+
+Predicted 5-12%; measured 6.5%, at the low end. The append calls
+themselves were only 0.073 s of instrumented self time; the larger
+share of the cost was the slice allocations, which the profile does not
+attribute to a named function. Predicting the cost of allocation
+remains the least reliable part of these estimates - it was
+underestimated for move_to_front (16.8% measured against 4-8%
+predicted) and overestimated here.
+
+
+Why optimization stops here
+---------------------------
+
+The remaining candidate from the original analysis was bwt_transform's
+character counting, which the source itself calls a "semi-inefficient
+way to get the character counts": it sorts the whole block and then
+issues 256 bytes.find calls. Replacing it with a histogram and prefix
+sum would be an asymptotic improvement, but it accounts for only 0.103 s
+of 2.154 s instrumented (and bytes.find, being C code, measured just
+0.002 s). The expected gain does not justify touching the most delicate
+part of the decoder, whose own comments document a historical
+off-by-one bug in the inverse BWT.
+
+
+Final result for this benchmark
+-------------------------------
+
+    baseline  1.11 sec         --
+    opt1      1.04 sec         inline the bit-mask helper          6.3%
+    opt2      865 ms           rewrite move_to_front              16.8%
+    opt3      799 ms           length-indexed huffman decode       7.6%
+    opt4      738 ms           hoist RLE loop length checks        7.6%
+    opt5      690 ms           batch literal spans                 6.5%
+
+    Cumulative: 1.609x faster, 37.8% reduction
+
+Every individual step exceeded the project's 7% threshold or came
+within a point of it, and the output passed the benchmark's own MD5
+verification at every stage.
