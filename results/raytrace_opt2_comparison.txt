@@ -1,0 +1,110 @@
+Raytrace Optimization 2: Remove No-Op Type Assertions
+=====================================================
+
+Date   : 2026-09-21
+Commit : a7c17aa
+File   : bm_raytrace_opt/run_benchmark.py
+Target : Vector.__sub__, Vector.dot, Vector.cross, Point.__add__
+
+
+The change
+----------
+
+Four call sites of the form
+
+    def dot(self, other):
+        other.mustBeVector()          <-- removed
+        return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
+
+were removed, in Vector.__sub__, Vector.dot, Vector.cross and
+Point.__add__. The mustBeVector / mustBePoint method definitions
+themselves are retained.
+
+
+Rationale
+---------
+
+cProfile measured Vector.mustBeVector at 2,602,695 calls over 5 frames,
+consuming 0.348 s of self time while returning its own argument. For a
+Vector receiver the method body is literally "return self".
+
+These were genuine type assertions rather than dead code: the Point
+class defines mustBeVector to raise. Two facts justify removing them
+from the hot paths anyway.
+
+First, every one of these call sites is reachable only with Vector
+arguments. The types are guaranteed by construction: Vector.dot is
+called on ray directions and surface normals, all of which are built by
+Vector-returning operations.
+
+Second, the assertion can no longer report the error it was written for.
+The body is
+
+    raise 'Points are not vectors!'
+
+which was valid in Python 2, where string exceptions were permitted.
+Under Python 3 this produces:
+
+    TypeError: exceptions must derive from BaseException
+
+so the intended diagnostic message never reaches the user. The check
+still aborts the program, but with a misleading error.
+
+The assertion in Sphere.__init__ (centre.mustBePoint()) was deliberately
+KEPT. It executes 7 times per frame setup rather than millions of times
+per frame, so its cost is immeasurable, and it preserves a real sanity
+check at scene-construction time where an error is plausible.
+
+Relation to the perf profile: results/raytrace_perf_baseline.txt
+measured ~10.9% of self time in Python call and frame machinery
+(call_function, _PyFrame_New_NoTrack, frame_dealloc,
+_PyEval_MakeFrameVector). Removing 2.6 million calls removes 2.6 million
+frame allocate/deallocate pairs from exactly that path.
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    opt1 (shadow ray hoist only) : 622 ms +- 5 ms
+    opt2 (this change)           : 573 ms +- 3 ms
+
+Isolated contribution of this change:
+
+    python3 -m pyperf compare_to \
+        results/raytrace_opt1.json results/raytrace_opt2.json
+    => 49 ms saved, 7.9% reduction (1.09x faster)
+
+Cumulative against the original baseline:
+
+    python3 -m pyperf compare_to \
+        results/raytrace_baseline.json results/raytrace_opt2.json
+    => 799 ms -> 573 ms: 1.40x faster
+    => 226 ms saved, 28.3% reduction
+
+This change would have met the project's >=7% threshold on its own,
+independently of optimization 1.
+
+
+Correctness
+-----------
+
+    f3c700588a9b6320fb1e46027142f205  /tmp/bm_raytrace.ppm
+    f3c700588a9b6320fb1e46027142f205  /tmp/bm_raytrace_opt.ppm
+
+Byte-identical to the pristine benchmark's output, unchanged from the
+hash recorded after optimization 1.
+
+
+Trade-off
+---------
+
+The optimized variant is now less defensive than the original: passing a
+Point where a Vector is expected would yield an AttributeError from the
+arithmetic itself, or silently wrong geometry, rather than an immediate
+abort. For a fixed benchmark workload with statically known types this
+is an acceptable trade; for a general-purpose geometry library it would
+not be, and the appropriate fix there would be to convert the checks
+into real exceptions guarded by __debug__ so that python -O removes
+them.
