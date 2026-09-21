@@ -12,7 +12,6 @@
 #   ./script_raytrace.sh cprofile   per-function profile of both variants
 #   ./script_raytrace.sh flame      perf record + flame graph
 #   ./script_raytrace.sh flamecmp   baseline vs optimized + diff flame graph
-#   ./script_raytrace.sh pyflame    PYTHON-level flame graphs (py-spy)
 #   ./script_raytrace.sh all        everything except setup
 #
 # With no argument it runs: baseline, optimized, compare, verify.
@@ -217,106 +216,6 @@ stage_flamecmp() {
 }
 
 
-stage_pyflame() {
-    say "python-level flame graphs (py-spy)"
-
-    # perf cannot see Python functions on CPython 3.10: the perf
-    # trampoline support that exposes them arrived in 3.12. The
-    # DWARF-unwound graphs therefore show the interpreter's C stack,
-    # which is accurate but attributes nothing to BENCHMARK code, and
-    # goes very deep because each Python call becomes several C frames.
-    #
-    # py-spy reads CPython's interpreter state directly, so it reports
-    # Python function names at Python stack depth. This is the view
-    # that answers "which part of the benchmark is hot".
-    if ! command -v py-spy >/dev/null; then
-        echo "py-spy not found; install with: pip3 install py-spy" >&2
-        return 1
-    fi
-
-    local fg
-    fg="$(dirname "$(find "$HOME" -name flamegraph.pl 2>/dev/null | head -1)")"
-    if [ ! -x "$fg/flamegraph.pl" ]; then
-        echo "FlameGraph not found; run '$0 setup' first" >&2
-        return 1
-    fi
-
-    local loops=5 rate=200
-
-    local variant label
-    for variant in "$BASE_DIR" "$OPT_DIR"; do
-        case "$variant" in
-            *_opt) label=optimized ;;
-            *)     label=baseline ;;
-        esac
-        echo "--- $variant ---"
-
-        # --format raw emits folded stacks rather than py-spy's own SVG,
-        # so these graphs go through the same flamegraph.pl as the perf
-        # ones. Two reasons that matters: py-spy's built-in renderer
-        # draws an ICICLE graph (root at the top, growing downward),
-        # whereas flamegraph.pl draws the conventional bottom-up flame
-        # graph, and flamegraph.pl accepts a real --title.
-        #
-        # No --subprocesses: the driver runs in a single process, and
-        # py-spy fails with "No child process" trying to reap a child
-        # that has already exited.
-        #
-        # The trailing `|| true` is load bearing. py-spy writes its
-        # output, reports the sample count, and THEN fails trying to
-        # reap a child that has already exited:
-        #     Error: No child process (os error 10)
-        # Under `set -e` a successful profile would therefore abort the
-        # script. The exit status is ignored and the artifact is checked
-        # instead, which is the thing actually being relied on.
-        py-spy record --format raw --rate "$rate" \
-            --output "/tmp/${variant}.pyfolded" \
-            -- python3 "$REPO/profile_raytrace.py" \
-                  --variant "$variant" --loops "$loops" || true
-
-        if [ ! -s "/tmp/${variant}.pyfolded" ]; then
-            echo "py-spy wrote no samples for $variant" >&2
-            return 1
-        fi
-
-        # py-spy roots every stack at 'process <pid>:"<full command>"'.
-        # That frame is a whole command line wide, so it squashes the
-        # real root to nothing, and it embeds a PID that changes every
-        # run, which makes the committed SVGs differ on content that
-        # carries no information. Drop it and let the driver's <module>
-        # frame be the root.
-        sed -i -e 's/^process [0-9]*:"[^"]*";//' -e 's/^all;//' \
-            "/tmp/${variant}.pyfolded"
-    done
-
-    # --minwidth trades a little completeness for legibility. Without it
-    # the graph is ~64 rows tall, but half those rows exist only to hold
-    # 1-sample slivers: interpreter startup (importlib, sre_parse) and
-    # the thin tail of rayColour's recursion. At ~900 samples 0.5% is
-    # about 4 samples, and a box that thin cannot fit a label, so those
-    # rows cost height without conveying anything. The threshold is
-    # named in the subtitle rather than applied silently.
-    local minwidth=0.5
-
-    "$fg/flamegraph.pl" \
-        --title "raytrace BASELINE - Python level (py-spy, ${rate} Hz)" \
-        --subtitle "${loops} renders on python3; frames under ${minwidth}% omitted" \
-        --minwidth "$minwidth" \
-        "/tmp/$BASE_DIR.pyfolded" \
-        > "$RESULTS/raytrace_baseline_python_flame.svg"
-
-    "$fg/flamegraph.pl" \
-        --title "raytrace OPTIMIZED - Python level (py-spy, ${rate} Hz)" \
-        --subtitle "${loops} renders on python3; frames under ${minwidth}% omitted" \
-        --minwidth "$minwidth" \
-        "/tmp/$OPT_DIR.pyfolded" \
-        > "$RESULTS/raytrace_optimized_python_flame.svg"
-
-    echo
-    ls -la "$RESULTS"/raytrace_*_python_flame.svg
-}
-
-
 main() {
     case "${1:-default}" in
         setup)     stage_setup ;;
@@ -327,7 +226,6 @@ main() {
         cprofile)  stage_cprofile ;;
         flame)     stage_flame ;;
         flamecmp)  stage_flamecmp ;;
-        pyflame)   stage_pyflame ;;
         all)
             stage_baseline
             stage_optimized
@@ -336,7 +234,6 @@ main() {
             stage_cprofile
             stage_flame
             stage_flamecmp
-            stage_pyflame
             ;;
         default)
             stage_baseline
