@@ -1,0 +1,158 @@
+Pyflate Baseline Profile (perf + flame graph)
+=============================================
+
+Date  : 2026-09-21
+Tool  : perf 5.15.209, FlameGraph (brendangregg), python3-dbg 3.10.12
+Graph : results/pyflate_baseline_flame.svg
+
+
+Collection
+    10|----------
+
+Same constraints as the raytrace profile, documented in full in
+results/raytrace_perf_baseline.txt: the QEMU guest exposes no PMU, so
+the hardware 'cycles' event collects nothing and profiling runs on the
+'cpu-clock' software event, which measures elapsed time rather than
+retired cycles. Frame-pointer unwinding on the debug build produces
+garbage frames built from allocator fill bytes, so DWARF unwinding is
+used instead.
+
+    20|    perf record -e cpu-clock -F 299 --call-graph dwarf \
+        -o /tmp/pyflate_dwarf.data \
+        -- python3-dbg profile_pyflate.py --variant bm_pyflate --loops 2
+
+    1,964 samples in 15.836 MB
+
+    perf script -i /tmp/pyflate_dwarf.data > /tmp/pyflate.perf
+    stackcollapse-perf.pl /tmp/pyflate.perf > /tmp/pyflate.folded
+    flamegraph.pl /tmp/pyflate.folded > results/pyflate_baseline_flame.svg
+
+    30|DWARF unwinding worked better here than on the raytrace run: stacks
+resolve continuously from _start through __libc_start_main into the
+interpreter, with none of the unresolved [unknown] frames that
+contaminated the earlier profile.
+
+
+What the flame graph can and cannot show
+----------------------------------------
+
+The graph contains 577 distinct frames and not one of them is a pyflate
+    40|function. Searching it for find_next_symbol, bwt_reverse or
+move_to_front returns nothing.
+
+This is not a collection failure. CPython 3.10 has no perf trampoline
+support, which arrived in 3.12 behind PYTHONPERFSUPPORT. Without it the
+interpreter executes Python-level functions as data inside
+_PyEval_EvalFrameDefault rather than as native frames, so perf sees the
+interpreter's own C call structure and nothing of the program running
+on top of it.
+
+    50|The flame graph is therefore read as a picture of WHAT KIND of work
+the interpreter is doing, not of which pyflate function is doing it.
+cProfile supplies the missing attribution
+(results/pyflate_baseline.txt), and the two are cross-checked below.
+
+
+Flat profile, self time
+-----------------------
+
+    perf report --stdio --no-children -g none
+    60|
+    23.12%  _PyEval_EvalFrameDefault
+     3.77%  _PyMem_DebugCheckAddress
+     3.56%  read_size_t
+     2.85%  call_function.lto_priv.0
+     2.70%  __memset_avx2_unaligned_erms          (libc)
+     2.70%  pthread_getspecific                   (libc)
+     2.39%  list_dealloc.lto_priv.0
+     2.24%  list_ass_slice
+     1.93%  lookdict_unicode_nodummy
+    70|     1.73%  _PyObject_Malloc
+     1.48%  _PyMem_DebugRawAlloc
+     1.37%  _PyObject_VectorcallTstate.lto_priv.10
+     1.37%  arena_map_get
+     1.32%  PyObject_RichCompare
+     1.32%  _PyDict_GetItemHint
+     1.32%  binary_op1
+     1.17%  PyTuple_GetItem
+     1.12%  PyGILState_Check
+     1.12%  write_size_t
+    80|
+
+Roughly 12% of this profile is an artifact
+------------------------------------------
+
+    _PyMem_DebugCheckAddress   3.77%
+    read_size_t                3.56%
+    _PyMem_DebugRawAlloc       1.48%
+    arena_map_get              1.37%
+    PyGILState_Check           1.12%
+    90|    write_size_t               1.12%
+    --------------------------------------
+                              ~12.4%
+
+plus an unknown share of __memset_avx2_unaligned_erms.
+
+These are python3-dbg's debug allocator: writing guard bytes around
+every allocation, re-reading and validating them on free, and checking
+GIL state on operations that assume it is held. None of this exists in
+the python3 build that produced the timings in pyflate_baseline.txt and
+   100|the optimization comparisons.
+
+The debug build is used because it is the only one carrying the symbols
+DWARF unwinding needs. The cost of being able to see anything at all is
+that roughly an eighth of what is visible is the observer. These rows
+are discounted rather than reported as pyflate's behavior.
+
+
+Cross-check against cProfile
+----------------------------
+
+   110|Discounting the artifact rows, the remainder corroborates the cProfile
+findings from an entirely independent measurement, and names at the C
+level the work that three of the five optimizations removed:
+
+  list_ass_slice          2.24%   move_to_front's slice assignment
+  list_dealloc            2.39%   destroying the temporary lists it built
+
+      The baseline move_to_front is
+          l[:] = l[c:c + 1] + l[0:c] + l[c + 1:]
+      which is literally a list slice assignment fed by three freshly
+   120|      built temporaries. Both halves of its cost appear here as named
+      C functions. This is the change that gained 16.8%.
+
+  PyObject_RichCompare    1.32%   x.symbol == cached, per table entry
+  lookdict_unicode_nodummy 1.93%  fetching .bits / .symbol per entry
+
+      The baseline find_next_symbol walks the table comparing each
+      entry's symbol against the peeked bits, reading two attributes
+      per iteration. The linear scan shows up as comparison plus
+      attribute dictionary lookup rather than as a named function.
+   130|      This is the work the length-indexed dict replaced, and the work
+      the hardware accelerator removes outright.
+
+  call_function           2.85%   Python-level call entry
+
+      Corroborates the 655,017 calls to the one-line _mask helper that
+      cProfile counted, and which inlining eliminated.
+
+Two tools measuring different quantities by different mechanisms -
+deterministic per-function instrumentation versus timer-driven
+   140|sampling of native symbols - agree on where the time goes. Neither
+alone would be as persuasive.
+
+
+Why perf did not change the optimization plan
+---------------------------------------------
+
+Honesty requires noting that the optimization decisions came from
+cProfile, not from this profile. perf on CPython 3.10 cannot name a
+Python function, so it can rank kinds of work but cannot point at the
+   150|line to change.
+
+Its value here is confirmatory and diagnostic: it independently
+established that list slice manipulation, attribute lookup and rich
+comparison were genuinely hot, which is what makes the cProfile
+attribution trustworthy rather than merely plausible. Had perf shown
+the time going somewhere cProfile did not predict, that disagreement
+would have been the most interesting result in the project.
