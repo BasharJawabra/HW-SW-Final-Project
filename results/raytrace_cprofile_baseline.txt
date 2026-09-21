@@ -1,0 +1,107 @@
+Raytrace Baseline Hotspot Analysis (cProfile)
+=============================================
+
+Date    : 2026-09-21
+Command : python3 profile_raytrace.py --loops 5 --cprofile
+Source  : bm_raytrace/run_benchmark.py (pristine pyperformance source)
+
+Totals
+------
+15,431,530 function calls (15,397,145 primitive) in 9.680 s over 5 renders
+=> 1936.0 ms per render under cProfile instrumentation
+=> ~3.1 million Python function calls per 100x100 frame
+
+Note on absolute numbers: cProfile's per-call instrumentation inflates
+runtime roughly 2.5x versus the uninstrumented 787.7 ms per render. The
+ABSOLUTE times below are therefore not comparable to the pyperf baseline;
+the RELATIVE ranking and the call counts are what matter, and call counts
+are exact.
+
+Top entries by self time (tottime)
+----------------------------------
+    ncalls   tottime   cumtime  function
+   2549355     1.635     1.975  Vector.dot                     (line 51)
+   1389325     1.369     2.080  Point.__sub__                  (line 113)
+    897285     1.151     3.865  Sphere.intersectionTime        (line 142)
+   2264715     0.834     0.834  Vector.__init__                (line 24)
+     53330     0.616     4.489  Scene._lightIsVisible          (line 283)
+    748715     0.472     0.751  Vector.scale                   (line 48)
+    549435     0.403     1.831  Vector.normalized              (line 61)
+    549435     0.364     0.883  Vector.magnitude               (line 35)
+   2602695     0.348     0.348  Vector.mustBeVector            (line 76)
+     76325     0.329     2.739  rayColour intersections listcomp (line 271)
+    490860     0.299     1.936  Ray.__init__                   (line 177)
+ 26665/18945   0.245     6.638  SimpleSurface.colourAt         (line 315)
+         5     0.229     9.663  Scene.render                   (line 245)
+   1389325     0.201     0.201  Point.isPoint                  (line 122)
+ 76665/50000   0.199     8.740  Scene.rayColour                (line 266)
+     50000     0.140     0.222  Canvas.plot                    (line 200)
+    100000     0.103     0.154  Vector.__add__                 (line 38)
+     76325     0.094     0.094  firstIntersection              (line 213)
+    584105     0.085     0.085  math.sqrt                      (builtin)
+    127505     0.084     0.180  Halfspace.intersectionTime     (line 164)
+     26665     0.059     4.557  Scene.visibleLights            (line 290)
+     19285     0.058     0.118  CheckerboardSurface.baseColourAt (line 346)
+     79995     0.057     0.057  addColours                     (line 298)
+    176665     0.057     0.057  builtins.min                   (builtin)
+     26665     0.044     0.164  Vector.reflectThrough          (line 82)
+
+Findings
+--------
+
+1. Loop-invariant object construction in the shadow-ray test (biggest win)
+
+   Scene._lightIsVisible builds Ray(p, l - p) inside the loop over
+   scene objects, but that expression depends only on l and p, which do
+   not change across iterations. With 8 objects in the scene the same
+   Ray is constructed up to 8 times per call for no reason.
+
+   Ray.__init__ normalizes its direction vector, so each redundant
+   construction costs a Point.__sub__, a Vector.normalized (which is a
+   magnitude -> math.sqrt plus a scale that allocates another Vector).
+
+   Evidence: the visibleLights/_lightIsVisible subtree accounts for
+   4.557 s of 9.680 s, i.e. ~47% of total runtime. Ray.__init__ is
+   entered 490,860 times with 1.936 s cumulative.
+
+   Hoisting the construction above the loop is semantics-preserving:
+   the loop body neither mutates the Ray nor depends on iteration
+   order for its value.
+
+2. Runtime type assertions that compute nothing
+
+   Vector.mustBeVector is called 2,602,695 times and its entire body is
+   "return self". Point.isPoint is called 1,389,325 times to return a
+   constant False. Together that is ~4.0 million function calls whose
+   only purpose is defensive type checking in code whose types are
+   already statically known by construction.
+
+   These are invoked from the hottest paths: Vector.dot calls
+   other.mustBeVector() on every one of its 2,549,355 invocations, and
+   Vector.__sub__ / Point.__sub__ do the same.
+
+3. Object allocation churn
+
+   Vector.__init__ runs 2,264,715 times. Vector, Point and Ray are all
+   plain classes without __slots__, so every instance carries a full
+   __dict__. Adding __slots__ reduces per-instance memory and speeds up
+   attribute access, which matters given that dot alone performs six
+   attribute reads per call.
+
+4. Redundant work inside normalized()
+
+   Vector.normalized (549,435 calls) calls magnitude() then scale(),
+   allocating an intermediate and paying an extra Python-level call.
+   Computing the reciprocal once and constructing the result Vector
+   directly removes one call and one allocation per invocation.
+
+Planned optimizations, in priority order
+----------------------------------------
+  1. Hoist the loop-invariant Ray out of _lightIsVisible
+  2. Remove mustBeVector / mustBePoint / isPoint / isVector from hot paths
+  3. Add __slots__ to Vector, Point, Ray and Sphere
+  4. Inline the reciprocal in normalized(), dropping the scale() call
+  5. Reduce attribute lookups in Sphere.intersectionTime
+
+Each is applied and measured as an independent change so that its
+individual contribution to the >=7% target is attributable.
