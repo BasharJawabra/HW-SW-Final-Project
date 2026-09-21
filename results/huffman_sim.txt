@@ -1,0 +1,161 @@
+Huffman Decoder Accelerator - Simulation and Verification
+=========================================================
+
+Date      : 2026-09-21
+Design    : hw/huffman_decoder.sv
+Testbench : hw/huffman_decoder_tb.sv
+Vectors   : hw/gen_test_vectors.py -> hw/vectors/*.hex
+Simulator : Icarus Verilog, invoked as iverilog -g2012
+
+
+What is being verified
+    10|----------------------
+
+The accelerator replaces HuffmanTable.find_next_symbol, so the property
+that matters is not "the hardware decodes some Huffman stream" but "the
+hardware decodes the same symbols the Python implementation decodes".
+A testbench written by hand against a hand-built table cannot establish
+that: it would only show the hardware agrees with whatever the author
+believed the software does.
+
+The vectors are therefore generated from the benchmark's own code.
+    20|gen_test_vectors.py imports bm_pyflate_opt/run_benchmark.py, builds
+real OrderedHuffmanTable objects, and derives the canonical parameters
+the hardware needs directly from the populated table:
+
+    count[L]      number of codes of length L
+    first_code[L] numerically smallest length-L code
+    base_index[L] where length-L symbols start in the flat symbol table
+
+The encoder is the exact inverse of populate_huffman_symbols: symbol s
+is emitted as entry.bits bits of entry.symbol for the table entry whose
+    30|.code is s. No independent reimplementation of canonical Huffman code
+assignment exists anywhere in the flow, so the vectors cannot drift
+away from the software's interpretation.
+
+
+Vector properties
+-----------------
+
+    2 Huffman groups, alternating every 50 symbols (selectors 0 1 0 1 0)
+    40 symbols per group, code lengths 4..10
+    40|    230 body symbols + 1 EOB symbol
+    1359 encoded bits = 43 words of 32 bits
+
+Two Huffman groups rather than one is deliberate: bzip2 reselects the
+active table every 50 symbols, and the accelerator walks the selector
+list autonomously. With a single group that control path would never be
+exercised and a broken table switch would pass unnoticed.
+
+
+Checks performed
+    50|----------------
+
+Per symbol
+    the decoded symbol matches the Python decode, in order
+
+At end of stream
+    EOB terminates decoding rather than being streamed onward
+    no symbol is emitted after EOB
+    symbol_count equals 230, i.e. EOB is excluded from the count
+    final_bit_pos equals 1359
+    60|    error is never asserted
+    decoding completes rather than hitting the cycle timeout
+
+final_bit_pos deserves comment. The decoder is pipelined, so at the
+moment EOB retires, stage 1 has already consumed bits for whatever code
+followed it. If the design naively reported the current bit position it
+would report a value past the true end of the block, and software
+resuming its parse there would land mid-code at every block boundary.
+The expected value is carried in the vector metadata precisely so this
+is checked numerically rather than eyeballed.
+    70|
+
+Results
+-------
+
+    iverilog -g2012 -o /tmp/hd_tb hw/huffman_decoder.sv \
+                                  hw/huffman_decoder_tb.sv
+    vvp /tmp/hd_tb
+    vvp /tmp/hd_tb +backpressure
+
+    80|    sink always ready
+        symbols decoded : 230
+        cycles          : 234
+        cycles/symbol   : 1.02
+        final_bit_pos   : 1359 (expected 1359)
+        RESULT: PASS
+
+    sink stalls ~25% of cycles (+backpressure)
+        symbols decoded : 230
+        cycles          : 305
+    90|        cycles/symbol   : 1.33
+        final_bit_pos   : 1359 (expected 1359)
+        RESULT: PASS
+
+The unstalled figure of 1.02 cycles per symbol is the headline result:
+the design sustains its one-symbol-per-clock target, and the 64-bit bit
+buffer keeps the decoder fed across a 32-bit input port without
+starving it. The 2% overhead is pipeline fill plus the first refills.
+
+Under backpressure the cycle count rises to 305, consistent with a sink
+   100|that refuses roughly a quarter of cycles, while the decoded symbols and
+final_bit_pos are unchanged. That is the outcome worth having: the
+stall path holds stage 2 without dropping a code, duplicating one, or
+letting the bit-position counter advance on a cycle where nothing was
+consumed.
+
+
+Two issues found and fixed during bring-up
+------------------------------------------
+
+   110|1. Invalid test vectors (defect in the test infrastructure)
+
+   The first generator drew code lengths at random. A Python round-trip
+   check then decoded only 231 bits for 231 symbols, one bit each.
+
+   The cause is that arbitrary code lengths do not satisfy the Kraft
+   equality, and canonical code assignment over invalid lengths yields
+   a code that is not prefix-free: a 1-bit code can be a prefix of a
+   longer code, and the decoder's shortest-match rule then always takes
+   the 1-bit one. The decoder was behaving correctly; the stimulus was
+   120|   meaningless.
+
+   Fixed by deriving lengths from an actual Huffman tree built over
+   random weights, with an assertion that sum(2^-L) == 1. This was
+   caught before ever reaching the simulator because the generator's
+   output is checked against the Python decoder first.
+
+2. Non-portable bit-select on a loop variable
+
+   Icarus reported:
+   130|
+       huffman_decoder.sv:195: sorry: constant selects in always_*
+       processes are not currently supported (all bits will be included)
+
+   from sel_len = L[4:0] in the length-arbitration loop. The simulation
+   passed anyway, because L never exceeds MAX_CODE_LEN and so fits in
+   five bits regardless, but it passed despite the construct rather
+   than because of it, and another tool could narrow differently.
+   Replaced with a plain assignment that relies on well-defined
+   implicit truncation.
+   140|
+
+What this does not establish
+----------------------------
+
+Simulation shows functional agreement on the stimulus supplied. It is
+not synthesis, and no timing, area or power numbers follow from it; the
+frequency discussed in report_pyflate.txt is an argument from the
+critical path, not a measured result.
+
+   150|Specifically not covered:
+
+  - the error path. No malformed stream is driven, so the "no code
+    matches once MAX_CODE_LEN bits are buffered" detector is only shown
+    never to fire spuriously, not shown to fire when it should.
+  - more than 2 of the 6 supported Huffman groups.
+  - code lengths outside 4..10, in particular the 1-bit and 20-bit
+    extremes that bzip2 permits.
+  - a real bzip2 stream from the benchmark data file end to end,
+    including block headers, which remain in software.
