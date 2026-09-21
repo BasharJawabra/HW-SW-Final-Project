@@ -136,9 +136,38 @@ stage_flame() {
         -- python3-dbg "$REPO/profile_raytrace.py" \
               --variant "$BASE_DIR" --loops 3
 
+    # Two separate things make a DWARF-unwound CPython flame graph
+    # unreadable, and they need different fixes.
+    #
+    # HEIGHT, and the box count that follows from it. Reaching one Python
+    # call costs a cycle of seven C frames (_PyEval_Vector,
+    # _PyEval_EvalFrame, _PyEval_EvalFrameDefault, call_function,
+    # PyObject_Vectorcall, _PyObject_VectorcallTstate,
+    # _PyFunction_Vectorcall) and that cycle repeats once per level of
+    # Python call depth. Measured on the previous graph: _PyEval_Vector
+    # appeared 809 times and the image was 127 rows tall.
+    #
+    # Note that stackcollapse-recursive.pl does NOT help here. It merges
+    # only ADJACENT duplicate frames, and this is a cycle of seven
+    # distinct names with no adjacent duplicates, so it collapses
+    # nothing. tools/collapse_interpreter.py folds each run of plumbing
+    # frames into one [python call] frame instead, which also merges
+    # identical leaves that were previously scattered across hundreds of
+    # spine depths. Sample counts are preserved exactly.
+    #
+    # WIDTH. Even after that, sub-1% frames remain, and at 9,525 boxes
+    # 92% of them were narrower than 1%. A box that thin cannot hold a
+    # label, and those boxes are most of the 1.8 MB file. --minwidth
+    # drops them.
+    local minwidth=1
+
     perf script -i /tmp/raytrace_dwarf.data > /tmp/raytrace.perf
-    "$fg/stackcollapse-perf.pl" /tmp/raytrace.perf > /tmp/raytrace.folded
-    "$fg/flamegraph.pl" --title "raytrace baseline (cpu-clock, DWARF unwind)" \
+    "$fg/stackcollapse-perf.pl" /tmp/raytrace.perf \
+        | "$REPO/tools/collapse_interpreter.py" > /tmp/raytrace.folded
+    "$fg/flamegraph.pl" \
+        --title "raytrace baseline (cpu-clock, DWARF unwind)" \
+        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         /tmp/raytrace.folded > "$RESULTS/raytrace_baseline_flame.svg"
 
     echo "wrote $RESULTS/raytrace_baseline_flame.svg"
@@ -165,6 +194,13 @@ stage_flamecmp() {
     # optimizations. The baseline is regenerated here for that reason.
     local loops=3 freq=299
 
+    # See stage_flame for why both of these are needed:
+    # collapse_interpreter.py fixes the height caused by the
+    # interpreter's repeating call cycle, --minwidth fixes the residual
+    # box count and file size. Both sides get identical treatment, which
+    # matters because difffolded.pl matches stacks by name.
+    local minwidth=1
+
     local variant
     for variant in "$BASE_DIR" "$OPT_DIR"; do
         echo "--- profiling $variant ---"
@@ -174,15 +210,20 @@ stage_flamecmp() {
                   --variant "$variant" --loops "$loops"
         perf script -i "/tmp/${variant}.data" > "/tmp/${variant}.perf"
         "$fg/stackcollapse-perf.pl" "/tmp/${variant}.perf" \
+            | "$REPO/tools/collapse_interpreter.py" \
             > "/tmp/${variant}.folded"
     done
 
     "$fg/flamegraph.pl" \
         --title "raytrace BASELINE (cpu-clock, DWARF unwind)" \
+        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         "/tmp/$BASE_DIR.folded" > "$RESULTS/raytrace_baseline_flame.svg"
 
     "$fg/flamegraph.pl" \
         --title "raytrace OPTIMIZED (cpu-clock, DWARF unwind)" \
+        --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+        --minwidth "$minwidth" \
         "/tmp/$OPT_DIR.folded" > "$RESULTS/raytrace_optimized_flame.svg"
 
     # Sampling is time-based at a fixed frequency, so sample counts are
@@ -191,6 +232,8 @@ stage_flamecmp() {
     "$fg/difffolded.pl" "/tmp/$BASE_DIR.folded" "/tmp/$OPT_DIR.folded" \
         | "$fg/flamegraph.pl" \
             --title "raytrace: optimized vs baseline (blue = time removed)" \
+            --subtitle "interpreter call frames collapsed; frames under ${minwidth}% omitted" \
+            --minwidth "$minwidth" \
             --negate \
         > "$RESULTS/raytrace_diff_flame.svg"
 
