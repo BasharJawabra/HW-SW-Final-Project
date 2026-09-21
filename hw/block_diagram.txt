@@ -1,0 +1,205 @@
+Huffman Decoder Accelerator - Block Diagrams
+============================================
+
+Design : hw/huffman_decoder.sv
+An SVG rendering of the same two diagrams is in hw/block_diagram.svg.
+
+
+1. System integration
+=====================
+    10|
+  +-------------------------------------------------------------------+
+  |                            HOST CPU                               |
+  |                   CPython 3.10, bm_pyflate_opt                    |
+  |                                                                   |
+  |   bzip2_main()                                                    |
+  |     +-- read block header .......................... SOFTWARE     |
+  |     +-- compute_used() / compute_tables() .......... SOFTWARE     |
+  |     +-- compute_selectors_list() ................... SOFTWARE     |
+  |     |                                                             |
+    20|  |     +-- decode_huffman_block()                                  |
+  |     |      +-- find_next_symbol() x148,271 ....... ACCELERATED   |
+  |     |      +-- move_to_front() ..................... SOFTWARE     |
+  |     |      +-- bwt_reverse() ....................... SOFTWARE     |
+  |     |      +-- RLE expansion ....................... SOFTWARE     |
+  +---------+-------------------------------------+-----------------+
+            |                                     |
+            | AXI4-Lite                           | descriptors
+            | (control + table load)              |
+            v                                     v
+    30|  +----------------------+            +--------------------------+
+  |   Register file      |            |      DMA engine          |
+  |----------------------|            |--------------------------|
+  | 0x00 CTRL    (start) |            |  MM2S: compressed stream |
+  | 0x04 STATUS          |            |  S2MM: decoded symbols   |
+  | 0x08 EOB_SYMBOL      |            +------+-------------+-----+
+  | 0x0C SYMBOL_COUNT    |                   |             ^
+  | 0x10 FINAL_BIT_POS   |                   |             |
+  | 0x14 TBL_WRITE       |          AXI4-Stream           AXI4-Stream
+  | 0x18 SYM_WRITE       |            32-bit in           9-bit out
+    40|  | 0x1C SEL_WRITE       |                   |             |
+  +----------+-----------+                   v             |
+             |                        +------------------------------+
+             +----------------------->|   huffman_decoder.sv         |
+                   table / selector   |   (detailed in section 2)    |
+                   contents           +------------------------------+
+                                                   ^
+                                                   |
+  +------------------------------------------------+----------------+
+  |                        DDR / system memory                      |
+    50|  |   compressed block bits  ---->  MM2S                            |
+  |   decoded symbol array   <----  S2MM                            |
+  +-----------------------------------------------------------------+
+
+
+Why the boundary sits here
+--------------------------
+
+Block header parsing and table construction stay in software: they run
+once per block (a few hundred times over the whole file) rather than
+    60|once per symbol, so moving them to hardware would add interface
+complexity for no measurable gain.
+
+Symbols leave over DMA into a memory buffer, NOT through a
+"read next symbol" register. Per-symbol programmed I/O would require
+~148,271 Python-level reads per decompression; at even 1 us each that
+is ~148 ms, which would consume most of the ~345 ms the accelerator is
+meant to save. This is the single most important integration
+constraint in the design and it is discussed further in
+results/pyflate_accel_analysis.txt.
+    70|
+
+2. Accelerator internals
+========================
+
+                     AXI4-Stream in, 32-bit words
+                                |
+                                v
+                 +------------------------------+
+                 |     BIT BUFFER  (64-bit)     |
+    80|                 |------------------------------|
+   s_ready <------ | MSB-aligned, matches the     |
+                 | RBitfield reader: bzip2 is   |
+                 | consumed MSB-first           |
+                 | refill when count <= 32      |
+                 | shift out consume_len bits   |
+                 +---------------+--------------+
+                                 |
+                          peek = top 20 bits
+                                 |
+    90|       +-------------------------------------------------+
+       |                                                 |
+       v                                                 v
+  +---------------------------------------+      +----------------+
+  |  STAGE 1: parallel length evaluation  |      | GROUP CONTROL  |
+  |---------------------------------------|      |----------------|
+  |                                       |      | selector RAM   |
+  |  for every length L = 1 .. 20,        |<-----| cur_table[2:0] |
+  |  all 20 evaluated CONCURRENTLY:       |      | group_left     |
+  |                                       |      | reload every   |
+   100|  |    cand[L]   = peek >> (20 - L)       |      | 50 symbols    |
+  |    offset[L] = cand[L] - first_code[L]|      +----------------+
+  |    hit[L]    = count[L] != 0          |
+  |             && cand[L] >= first_code[L]      +----------------+
+  |             && offset[L] < count[L]   |<-----| PER-LENGTH     |
+  |             && bits_available >= L    |      | TABLE RAM      |
+  |                                       |      |----------------|
+  +-------------------+-------------------+      | first_code[L]  |
+                      |                          | count[L]       |
+              hit[1..20] (one-hot by             | base_index[L]  |
+   110|              prefix-free property)          | x 6 groups     |
+                      |                          +----------------+
+                      v
+        +-----------------------------+
+        |  SHORTEST-MATCH ARBITER     |
+        |-----------------------------|
+        |  descending priority scan   |
+        |  -> sel_len, sel_hit        |
+        +--------------+--------------+
+                       |
+   120|         sel_len ---+----------------> back to BIT BUFFER
+                       |                   (consume sel_len bits,
+                       |                    advance bit_pos)
+                       v
+        +-----------------------------+
+        |  sym_index =                |
+        |    base_index[sel_len]      |
+        |  + offset[sel_len]          |
+        +--------------+--------------+
+                       |
+   130|  - - - - - - - - - | - - - - - - - - - -  pipeline register
+                       v
+        +-----------------------------+
+        |  STAGE 2: SYMBOL RAM        |
+        |-----------------------------|
+        |  flat table, ordered by     |
+        |  (length, code), 258 entries|
+        |  x 6 groups                 |
+        +--------------+--------------+
+                       |
+   140|                       +--> m_data (9-bit symbol) --> AXI4-Stream out
+                       |
+                       v
+        +-----------------------------+
+        |  EOB DETECT / COMPLETION    |
+        |-----------------------------|
+        |  symbol == eob_symbol ?     |
+        |    -> done = 1, busy = 0    |
+        |    -> final_bit_pos =       |
+        |         position AFTER eob  |
+   150|        |  else symbol_count++        |
+        +-----------------------------+
+
+
+3. The idea that makes it one cycle
+===================================
+
+The software decoder walks a table one entry at a time because it has
+to discover the code length by trying lengths in turn. The hardware
+does not need to search at all, because pyflate assigns codes
+   160|canonically in populate_huffman_symbols: for each length, codes are
+consecutive integers starting at first_code[L].
+
+So for a candidate taken from the top L bits of the stream, a
+length-L code matches exactly when
+
+    cand - first_code[L] < count[L]
+
+which is one subtraction and one comparison, and the symbol is then at
+
+   170|    base_index[L] + (cand - first_code[L])
+
+in a flat table. No codes are stored and none are compared.
+
+All 20 lengths are tested at once, and the result is unambiguous
+because a Huffman code is prefix-free: at most one length can match, so
+the arbiter is choosing among mutually exclusive hits rather than
+resolving a genuine conflict. The descending priority scan is
+belt-and-braces, and it makes the shortest match win if a malformed
+table ever produced two.
+   180|
+
+4. Critical path and frequency
+==============================
+
+The longest combinational path runs:
+
+    bit buffer -> peek -> 20 parallel (subtract, compare)
+               -> 20-way priority arbiter -> sel_len
+               -> 64-bit barrel shift -> bit buffer register
+   190|
+The comparisons are wide but fully parallel, so they contribute one
+subtractor delay rather than twenty. The arbiter and the barrel shift
+are the two serial elements, and the shift is the more expensive: a
+64-bit shift by a 5-bit amount is five mux levels.
+
+A 200 MHz target on a mid-range FPGA is reasonable for this structure.
+That is an argument from the path, NOT a synthesis result; nothing here
+has been synthesized and no timing report exists.
+
+   200|It also does not matter much. As shown in
+results/pyflate_accel_analysis.txt, even at 100 MHz the decoder needs
+~1.5 ms per decompression against ~345 ms of remaining software, so the
+design is bounded by Amdahl's law and not by its own clock. If timing
+closure were a problem, the obvious fix is to retime the barrel shift
+into its own stage, costing one cycle of latency and no throughput.
