@@ -12,6 +12,7 @@
 #   ./script_raytrace.sh cprofile   per-function profile of both variants
 #   ./script_raytrace.sh flame      perf record + flame graph
 #   ./script_raytrace.sh flamecmp   baseline vs optimized + diff flame graph
+#   ./script_raytrace.sh pyflame    PYTHON-level flame graphs (py-spy)
 #   ./script_raytrace.sh all        everything except setup
 #
 # With no argument it runs: baseline, optimized, compare, verify.
@@ -216,6 +217,41 @@ stage_flamecmp() {
 }
 
 
+stage_pyflame() {
+    say "python-level flame graphs (py-spy)"
+
+    # perf cannot see Python functions on CPython 3.10: the perf
+    # trampoline support that exposes them arrived in 3.12. The
+    # DWARF-unwound graphs therefore show the interpreter's C stack,
+    # which is accurate but attributes nothing to BENCHMARK code, and
+    # goes very deep because each Python call becomes several C frames.
+    #
+    # py-spy reads CPython's interpreter state directly, so it reports
+    # Python function names at Python stack depth. This is the view
+    # that answers "which part of the benchmark is hot".
+    if ! command -v py-spy >/dev/null; then
+        echo "py-spy not found; install with: pip3 install py-spy" >&2
+        return 1
+    fi
+
+    local variant label
+    for variant in "$BASE_DIR" "$OPT_DIR"; do
+        case "$variant" in
+            *_opt) label=optimized ;;
+            *)     label=baseline ;;
+        esac
+        echo "--- $variant ---"
+        py-spy record --format flamegraph --rate 200 --subprocesses \
+            --output "$RESULTS/raytrace_${label}_python_flame.svg" \
+            -- python3 "$REPO/profile_raytrace.py" \
+                  --variant "$variant" --loops 5
+    done
+
+    echo
+    ls -la "$RESULTS"/raytrace_*_python_flame.svg
+}
+
+
 main() {
     case "${1:-default}" in
         setup)     stage_setup ;;
@@ -226,6 +262,7 @@ main() {
         cprofile)  stage_cprofile ;;
         flame)     stage_flame ;;
         flamecmp)  stage_flamecmp ;;
+        pyflame)   stage_pyflame ;;
         all)
             stage_baseline
             stage_optimized
@@ -234,6 +271,7 @@ main() {
             stage_cprofile
             stage_flame
             stage_flamecmp
+            stage_pyflame
             ;;
         default)
             stage_baseline
