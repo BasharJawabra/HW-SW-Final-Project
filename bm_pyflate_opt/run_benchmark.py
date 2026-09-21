@@ -199,6 +199,21 @@ class HuffmanTable(object):
                 bits = x.bits
             x.symbol = symbol
             x.reverse_symbol = reverse_bits(symbol, bits)
+        self._build_lookup()
+
+    def _build_lookup(self):
+        self.bit_lengths = []
+        forward = {}
+        reverse = {}
+        for x in self.table:
+            if x.bits not in forward:
+                self.bit_lengths.append(x.bits)
+                forward[x.bits] = {}
+                reverse[x.bits] = {}
+            forward[x.bits].setdefault(x.symbol, x.code)
+            reverse[x.bits].setdefault(x.reverse_symbol, x.code)
+        self.forward_lookup = forward
+        self.reverse_lookup = reverse
 
     def tables_by_bits(self):
         d = {}
@@ -223,25 +238,15 @@ class HuffmanTable(object):
         return -1
 
     def find_next_symbol(self, field, reversed=True):
-        cached_length = -1
-        cached = None
-        for x in self.table:
-            if cached_length != x.bits:
-                cached = field.snoopbits(x.bits)
-                cached_length = x.bits
-            if (reversed and x.reverse_symbol == cached) or (not reversed and x.symbol == cached):
-                field.readbits(x.bits)
-                return x.code
+        lookup = self.reverse_lookup if reversed else self.forward_lookup
+        snoopbits = field.snoopbits
+        for bits in self.bit_lengths:
+            code = lookup[bits].get(snoopbits(bits))
+            if code is not None:
+                field.readbits(bits)
+                return code
         raise Exception("unfound symbol, even after end of table @%r"
                         % field.tell())
-
-        for bits in range(self.min_bits, self.max_bits + 1):
-            r = self._find_symbol(bits, field.snoopbits(bits), self.table)
-            if 0 <= r:
-                field.readbits(bits)
-                return r
-            elif bits == self.max_bits:
-                raise "unfound symbol, even after max_bits"
 
 
 class OrderedHuffmanTable(HuffmanTable):
