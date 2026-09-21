@@ -1,0 +1,126 @@
+Raytrace Baseline Profile (perf)
+================================
+
+Date : 2026-09-21
+Tool : perf 5.15.209, FlameGraph (brendangregg), python3-dbg 3.10.12
+
+
+1. Environment constraints discovered while setting up profiling
+----------------------------------------------------------------
+
+1a. No virtualized PMU: the hardware 'cycles' event yields zero samples.
+
+    perf record -q -o /tmp/probe.data -- python3 -c "sum(range(10**6))"
+    => Error: The /tmp/probe.data data has no samples!
+
+    The QEMU guest exposes no performance monitoring unit, so hardware
+    counter events collect nothing. All profiling therefore uses the
+    software event 'cpu-clock', which is driven by a timer interrupt.
+
+    Consequence for analysis: cpu-clock measures elapsed TIME, not
+    retired cycles. It cannot distinguish a pipeline stall from useful
+    work, and no IPC or cache-miss data is available. This is adequate
+    for ranking hot functions, which is what the optimization work
+    needs, but it means later hardware-acceleration estimates are
+    derived from measured time fractions rather than cycle counts.
+
+1b. Frame-pointer unwinding does not work on the debug build.
+
+    perf record -e cpu-clock -F 999 -g ... -- python3-dbg ...
+
+    produced call chains consisting of these "return addresses":
+
+        0xfdfdfdfdfd000053
+        0xfdfdfd
+        0xfdfdfdfdfdfdfd00
+        0xddddddfd
+
+    These are CPython debug-allocator fill patterns, not addresses:
+    a debug build paints memory with 0xFD (PYMEM_FORBIDDENBYTE) and
+    0xDD (PYMEM_DEADBYTE). The unwinder was walking uninitialized and
+    freed stack memory and reporting the fill bytes as frames, so any
+    flame graph built from this data is meaningless.
+
+    Fix: use DWARF-based unwinding, which relies on the debug info
+    rather than on frame pointers.
+
+        perf record -e cpu-clock -F 299 --call-graph dwarf \
+            -o results/raytrace_dwarf.data \
+            -- python3-dbg profile_raytrace.py --loops 3
+
+    DWARF mode stores a stack snapshot per sample, so perf.data grows
+    quickly; the sample rate and loop count were reduced accordingly.
+    Result: 1,987 samples in 16.013 MB, with clean symbol resolution.
+
+1c. Kernel symbols are unresolved (kptr_restrict is non-zero, and no
+    vmlinux is present for the 5.15.0-1106-kvm kernel). Only user-space
+    symbols are resolved. This does not affect the analysis, since the
+    workload is pure-Python compute with negligible system-call traffic.
+
+
+2. Flat profile
+---------------
+
+Event  : cpu-clock
+Samples: 21K (21,952,952,931 event count)
+Command: python3-dbg profile_raytrace.py --loops 10
+Report : perf report --stdio -g none
+
+  Children      Self  Shared Object  Symbol
+    28.55%    28.54%  python3.10d    _PyEval_EvalFrameDefault
+     6.52%     0.00%  [unknown]      0000000000000000
+     5.35%     0.00%  [unknown]      0x00000000009ad3c0
+     4.76%     0.00%  [unknown]      0x00000000009aeb40
+     4.22%     0.00%  [unknown]      0x00000000009a7640
+     3.80%     0.00%  [unknown]      0x00000000009a0ea0
+     3.45%     3.44%  python3.10d    call_function.lto_priv.0
+     3.38%     1.13%  python3.10d    _PyFrame_New_NoTrack
+     3.37%     3.37%  python3.10d    frame_dealloc.lto_priv.0
+     3.37%     0.00%  [unknown]      0x00000000009aaf60
+     2.99%     2.99%  python3.10d    _PyEval_MakeFrameVector
+     2.80%     0.00%  [unknown]      0x00000000009af720
+     2.67%     0.00%  [unknown]      0x00000000009acec0
+                      python3.10d    PyTuple_GetItem
+
+
+3. Interpretation
+-----------------
+
+The single largest symbol, _PyEval_EvalFrameDefault at 28.54% self
+time, is the bytecode dispatch loop; that is expected for any pure
+Python workload and is not by itself actionable.
+
+The actionable finding is the cluster immediately below it:
+
+    call_function            3.44%  self
+    frame_dealloc            3.37%  self
+    _PyEval_MakeFrameVector  2.99%  self
+    _PyFrame_New_NoTrack     1.13%  self
+    --------------------------------------
+    ~10.9% of self time in call/frame machinery
+
+This is the cost of entering and leaving Python functions: allocating a
+frame object, building its local-variable vector, and deallocating it.
+It is pure overhead with respect to the raytracing arithmetic.
+
+This independently corroborates the cProfile measurement in
+results/raytrace_cprofile_baseline.txt, which counted ~3.1 million
+Python function calls per 100x100 frame. perf says a large share of
+runtime goes into call setup and teardown; cProfile identifies which
+functions generate that call volume. The two tools answer different
+questions and agree.
+
+The conclusion that drives the optimization work is therefore that the
+most valuable changes are those that ELIMINATE CALLS, not those that
+make individual calls faster:
+
+  - hoisting the loop-invariant Ray out of Scene._lightIsVisible
+    removes up to 7 of every 8 Ray constructions, and with each one a
+    Point.__sub__, a Vector.normalized, a Vector.magnitude, a
+    math.sqrt and a Vector.scale
+
+  - deleting the no-op mustBeVector / isPoint assertions removes
+    ~4.0 million calls per 5 frames outright
+
+Both are call-count reductions, which is exactly what this profile
+says the program is bottlenecked on.
