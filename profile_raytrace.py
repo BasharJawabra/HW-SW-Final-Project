@@ -14,26 +14,41 @@ Two profiling modes are supported:
 The second mode exists because CPython 3.10 has no perf trampoline support
 (added in 3.12), so `perf` can only resolve C-level interpreter symbols.
 cProfile supplies the Python-level function attribution that perf cannot.
+
+--variant selects which copy of the benchmark to load, so the pristine and
+optimized versions can be profiled with an otherwise identical harness.
 """
 
 import argparse
+import importlib
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "bm_raytrace"))
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-import run_benchmark as raytrace  # noqa: E402
+
+def load_variant(variant):
+    path = os.path.join(REPO_ROOT, variant)
+    if not os.path.isdir(path):
+        sys.exit("no such benchmark variant: %s" % path)
+    sys.path.insert(0, path)
+    return importlib.import_module("run_benchmark")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--variant", default="bm_raytrace",
+                        help="benchmark directory to load "
+                             "(default: %(default)s)")
     parser.add_argument("--loops", type=int, default=10,
                         help="number of full scene renders (default: 10)")
-    parser.add_argument("--width", type=int, default=raytrace.DEFAULT_WIDTH,
-                        help="image width (default: %(default)s)")
-    parser.add_argument("--height", type=int, default=raytrace.DEFAULT_HEIGHT,
-                        help="image height (default: %(default)s)")
+    parser.add_argument("--width", type=int,
+                        help="image width (default: benchmark default)")
+    parser.add_argument("--height", type=int,
+                        help="image height (default: benchmark default)")
+    parser.add_argument("--ppm", metavar="PATH",
+                        help="write the final frame here, for output "
+                             "comparison between variants")
     parser.add_argument("--cprofile", action="store_true",
                         help="run under cProfile and print the top functions")
     parser.add_argument("--sort", default="tottime",
@@ -43,12 +58,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def run(args):
-    return raytrace.bench_raytrace(args.loops, args.width, args.height, None)
-
-
 def main():
     args = parse_args()
+    raytrace = load_variant(args.variant)
+
+    width = args.width if args.width else raytrace.DEFAULT_WIDTH
+    height = args.height if args.height else raytrace.DEFAULT_HEIGHT
+
+    def run():
+        return raytrace.bench_raytrace(args.loops, width, height, args.ppm)
 
     if args.cprofile:
         import cProfile
@@ -56,15 +74,16 @@ def main():
 
         profiler = cProfile.Profile()
         profiler.enable()
-        elapsed = run(args)
+        elapsed = run()
         profiler.disable()
-        stats = pstats.Stats(profiler, stream=sys.stdout)
-        stats.sort_stats(args.sort).print_stats(args.limit)
+        pstats.Stats(profiler, stream=sys.stdout) \
+              .sort_stats(args.sort) \
+              .print_stats(args.limit)
     else:
-        elapsed = run(args)
+        elapsed = run()
 
-    print("loops=%d geometry=%dx%d total=%.3fs per_loop=%.1fms"
-          % (args.loops, args.width, args.height,
+    print("variant=%s loops=%d geometry=%dx%d total=%.3fs per_loop=%.1fms"
+          % (args.variant, args.loops, width, height,
              elapsed, elapsed / args.loops * 1000.0))
 
 
