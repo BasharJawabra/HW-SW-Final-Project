@@ -243,7 +243,10 @@ stage_pyflame() {
             *)     label=baseline ;;
         esac
         echo "--- $variant ---"
-        py-spy record --format flamegraph --rate 200 --subprocesses \
+        # No --subprocesses: the driver runs in a single process, and
+        # py-spy fails with "No child process" trying to reap a child
+        # that has already exited.
+        py-spy record --format flamegraph --rate 200 \
             --output "$RESULTS/pyflate_${label}_python_flame.svg" \
             -- python3 "$REPO/profile_pyflate.py" \
                   --variant "$variant" --loops 5
