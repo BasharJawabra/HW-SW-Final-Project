@@ -1,0 +1,125 @@
+Raytrace Optimization 3: __slots__ on the Geometry Classes
+==========================================================
+
+Date   : 2026-09-21
+Commit : 8a6c512
+File   : bm_raytrace_opt/run_benchmark.py
+Target : Vector, Point, Ray, Sphere, Halfspace
+
+
+The change
+----------
+
+    class Vector(object):
+
+        __slots__ = ('x', 'y', 'z')
+
+        def __init__(self, initx, inity, initz):
+            ...
+
+Equivalent declarations added to:
+
+    Point      __slots__ = ('x', 'y', 'z')
+    Ray        __slots__ = ('point', 'vector')
+    Sphere     __slots__ = ('centre', 'radius')
+    Halfspace  __slots__ = ('point', 'normal')
+
+Scene, Canvas and the surface classes were left untouched: they are
+instantiated a handful of times per frame, and SimpleSurface is
+subclassed by CheckerboardSurface, where __slots__ would need care to
+avoid reintroducing a __dict__ in the subclass anyway.
+
+
+Rationale
+---------
+
+By default every instance of a Python class carries its own dictionary
+for attribute storage. __slots__ replaces that with a fixed array of
+descriptor-addressed slots, which has two distinct effects:
+
+  1. Attribute access becomes a slot descriptor read at a known offset
+     instead of a dict lookup. Vector.dot performs six attribute reads
+     per call over 2,549,355 calls, so this path is extremely hot.
+
+  2. Instance creation no longer allocates a separate dictionary. With
+     2,264,715 Vector.__init__ calls per 5 frames, this removes one
+     heap allocation and one deallocation per vector.
+
+The second effect turned out to dominate; see "Estimate versus result"
+below.
+
+
+Safety analysis
+---------------
+
+__slots__ restricts instances to the declared attribute names, so it is
+only safe if nothing assigns attributes dynamically. Verified by
+inspection: all five classes assign their attributes exclusively in
+__init__, and no code anywhere writes to an instance attribute of these
+types from the outside.
+
+One construct required checking. The module assigns singletons to the
+CLASSES after their bodies:
+
+    Vector.ZERO  = Vector(0, 0, 0)
+    Vector.RIGHT = Vector(1, 0, 0)
+    Vector.UP    = Vector(0, 1, 0)
+    Vector.OUT   = Vector(0, 0, 1)
+    Point.ZERO   = Point(0, 0, 0)
+
+These are class attributes, not instance attributes, and __slots__ does
+not constrain them. None of the names collide with a declared slot.
+
+Verified empirically before measuring: both variants were imported with
+a stubbed pyperf module and rendered a 40x40 frame, producing identical
+MD5 digests (4ef68b004bdcdfd7eebebef12e238c9c). The module-level
+assertions that exercise reflectThrough and __eq__ also still pass at
+import time.
+
+
+Measurement
+-----------
+
+Run configuration unchanged (-p 10 -w 1 -n 5):
+
+    opt2 (assertions removed) : 573 ms +- 3 ms
+    opt3 (this change)        : 497 ms +- 3 ms
+
+Isolated contribution:
+
+    python3 -m pyperf compare_to \
+        results/raytrace_opt2.json results/raytrace_opt3.json
+    => 76 ms saved, 13.3% reduction (1.15x faster)
+
+Cumulative against the original baseline:
+
+    python3 -m pyperf compare_to \
+        results/raytrace_baseline.json results/raytrace_opt3.json
+    => 799 ms -> 497 ms: 1.61x faster
+    => 302 ms saved, 37.8% reduction
+
+
+Estimate versus result
+----------------------
+
+Predicted 3-7%; measured 13.3%. The prediction was based on attribute
+access cost alone. The larger share of the gain evidently comes from
+allocation: a dict-less instance skips the creation and destruction of
+its attribute dictionary, and this benchmark allocates roughly 450,000
+vectors per frame. Reduced instance size should additionally improve
+cache locality, but with no virtualized PMU in this guest (see
+results/raytrace_perf_baseline.txt) cache behaviour cannot be measured
+directly, so that remains a plausible contributor rather than a
+measured one.
+
+
+Cumulative progress
+-------------------
+
+    baseline  799 ms +- 4 ms   --
+    opt1      622 ms +- 5 ms   hoist loop-invariant shadow ray
+    opt2      573 ms +- 3 ms   remove no-op type assertions
+    opt3      497 ms +- 3 ms   __slots__ on geometry classes
+
+    Total: 1.61x faster, 37.8% reduction, output byte-identical
+    throughout.
