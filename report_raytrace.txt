@@ -197,6 +197,17 @@ little call hierarchy. Both configurations are documented in
 results/raytrace_perf_baseline.txt and
 results/optimization_summary.txt.
 
+A second pair, results/raytrace_baseline_flame_raw.svg and
+results/raytrace_optimized_flame_raw.svg, renders those same recordings
+with no post-processing: no interpreter-frame collapsing and no width
+threshold. That is what perf's own built-in report, 'perf script report
+flamegraph', would have drawn, and it is committed so the effect of the
+processing can be checked rather than taken on trust - 493 boxes and
+2158 pixels of height, against 73 boxes and 158 pixels for the
+processed graph. The built-in report cannot run in this VM, because
+perf here is not linked against libpython and so executes no Python
+report scripts at all. Regenerate with ./script_raytrace.sh flameraw.
+
     28.55%  28.54%  _PyEval_EvalFrameDefault
      3.45%   3.44%  call_function
      3.38%   1.13%  _PyFrame_New_NoTrack
