@@ -18,8 +18,8 @@
 #
 # With no argument it runs: baseline, optimized, compare.
 # That is the sequence that produces the headline speedup number and it
-# takes a couple of minutes; the flame stage is much slower because it
-# runs the debug interpreter under perf.
+# takes a couple of minutes; the flame stages are slower still, since
+# each one re-records the benchmark under perf.
 
 set -euo pipefail
 
