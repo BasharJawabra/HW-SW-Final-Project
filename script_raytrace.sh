@@ -12,6 +12,8 @@
 #   ./script_raytrace.sh cprofile   per-function profile of both variants
 #   ./script_raytrace.sh flame      perf record + flame graph
 #   ./script_raytrace.sh flamecmp   baseline vs optimized + diff flame graph
+#   ./script_raytrace.sh flameraw   unfiltered graph, as the built-in
+#                                   perf report would have drawn it
 #   ./script_raytrace.sh all        everything except setup
 #
 # With no argument it runs: baseline, optimized, compare, verify.
@@ -327,6 +329,105 @@ stage_flamecmp() {
 }
 
 
+stage_flameraw() {
+    say "unfiltered flame graph"
+
+    local fg
+    fg="$(dirname "$(find "$HOME" -name stackcollapse-perf.pl 2>/dev/null \
+          | head -1)")"
+    if [ ! -x "$fg/stackcollapse-perf.pl" ]; then
+        echo "FlameGraph not found; run '$0 setup' first" >&2
+        return 1
+    fi
+
+    # The course slides show perf's built-in shortcut:
+    #
+    #     perf record -a -g -F 99 sleep 60
+    #     perf script report flamegraph
+    #
+    # That report cannot run in this VM. perf is not linked against
+    # libpython, so it executes no Python report scripts at all;
+    # /usr/libexec/perf-core/scripts does not exist; and the template
+    # package the report needs (libjs-d3-flame-graph) is not in the
+    # archive. Only the last of those is installable, and it is useless
+    # without the first, so the literal command would require building
+    # perf from source against libpython.
+    #
+    # The renderer is not the interesting difference anyway. The
+    # built-in draws whatever perf script emits, with no frame folding
+    # and no width threshold, while flamecmp applies both. So this
+    # stage reproduces what the built-in would have SHOWN by dropping
+    # those two processing steps and changing nothing else. That is
+    # also the form the slide's own screenshot is in: the image on it
+    # is a flamegraph.pl SVG, not perf's HTML output.
+    #
+    # Two departures from the slide's flags, both forced rather than
+    # chosen:
+    #
+    #   -e cpu-clock  the guest exposes no PMU, so the default cycles
+    #                 event returns zero samples; see stage_flame.
+    #   no -a         the slide samples the whole system for a fixed
+    #                 60 s. The subject here is a single process that
+    #                 runs to completion, so perf follows that process
+    #                 and there is nothing to time-box.
+    #
+    # -F 999 rather than 99 follows from the same reasoning: 99 Hz for
+    # the slide's 60 s is roughly 6000 samples, and this benchmark
+    # finishes in a few seconds, so the rate has to rise by about the
+    # same factor to land on a comparable number.
+    local variant
+    for variant in "$BASE_DIR" "$OPT_DIR"; do
+        echo "--- profiling $variant ---"
+        perf record -e cpu-clock -F 999 -g \
+            -o "/tmp/${variant}_raw.data" \
+            -- python3 "$REPO/profile_raytrace.py" \
+                  --variant "$variant" --loops 5
+
+        # No collapse_interpreter.py in the pipe, and no --minwidth on
+        # the renderer below. Those two omissions are the entire point
+        # of the stage, so they are deliberate, not oversights.
+        perf script -i "/tmp/${variant}_raw.data" \
+            | "$fg/stackcollapse-perf.pl" > "/tmp/${variant}_raw.folded"
+    done
+
+    local sub="every frame as perf reports it: no folding, no width filter"
+
+    "$fg/flamegraph.pl" \
+        --title "raytrace BASELINE (unfiltered, cpu-clock)" \
+        --subtitle "$sub" \
+        "/tmp/${BASE_DIR}_raw.folded" \
+        > "$RESULTS/raytrace_baseline_flame_raw.svg"
+
+    "$fg/flamegraph.pl" \
+        --title "raytrace OPTIMIZED (unfiltered, cpu-clock)" \
+        --subtitle "$sub" \
+        "/tmp/${OPT_DIR}_raw.folded" \
+        > "$RESULTS/raytrace_optimized_flame_raw.svg"
+
+    echo
+    echo "wrote:"
+    ls -la "$RESULTS"/raytrace_baseline_flame_raw.svg \
+           "$RESULTS"/raytrace_optimized_flame_raw.svg
+
+    # The processed graphs sit beside these, so the cost of leaving the
+    # stacks unprocessed is worth stating in numbers rather than
+    # leaving to the eye: distinct frames drive the box count and the
+    # file size, and depth drives the height.
+    say "what the processing steps remove"
+    local v
+    for v in "$BASE_DIR" "$OPT_DIR"; do
+        # The trailing " <count>" belongs to the leaf frame, not to the
+        # frame name, so it comes off before the stack is split.
+        awk -v tag="$v" \
+            '{sub(/ [0-9]+$/, ""); d=split($0, p, ";")
+              s+=d; n++; if(d>m)m=d
+              for(i=1;i<=d;i++) if(!(p[i] in f)) {f[p[i]]=1; u++}}
+             END {printf "%-18s mean depth %.1f, max %d, %d distinct frames\n",
+                          tag, s/n, m, u}' "/tmp/${v}_raw.folded"
+    done
+}
+
+
 main() {
     case "${1:-default}" in
         setup)     stage_setup ;;
@@ -337,6 +438,7 @@ main() {
         cprofile)  stage_cprofile ;;
         flame)     stage_flame ;;
         flamecmp)  stage_flamecmp ;;
+        flameraw)  stage_flameraw ;;
         all)
             stage_baseline
             stage_optimized
@@ -345,6 +447,7 @@ main() {
             stage_cprofile
             stage_flame
             stage_flamecmp
+            stage_flameraw
             ;;
         default)
             stage_baseline
@@ -354,7 +457,7 @@ main() {
             ;;
         *)
             echo "unknown stage: $1" >&2
-            sed -n '3,21p' "${BASH_SOURCE[0]}" >&2
+            sed -n '3,23p' "${BASH_SOURCE[0]}" >&2
             exit 1
             ;;
     esac
