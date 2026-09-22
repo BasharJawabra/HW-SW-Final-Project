@@ -1,0 +1,581 @@
+================================================================================
+ AI TOOL USAGE: PROMPTS AND INSTRUCTIONS
+================================================================================
+
+Project.md section 10 permits AI tools. Sections 1-3 contain the earlier
+prompt log, organised by task, with the reasoning behind each request
+and how the answer was used. That log names Cursor (Claude) as the tool
+used during development; its existing quotations are retained as supplied.
+
+Section 4 was drafted afterwards with help from Codex. It puts my
+optimization ideas and hardware proposal into first-person prompts,
+based on the implementation and results in this repository. These are
+reconstructed prompts, not verbatim messages from earlier conversations
+or evidence of when an idea was first suggested.
+
+
+================================================================================
+ 1. THE WORKING METHOD I IMPOSED
+================================================================================
+
+The first instruction set the method for the whole project, and it was
+enforced at every step afterwards:
+
+    "Guide me one discrete step at a time. For each step, provide the
+    exact file contents, the file path, and a clean Conventional Commit
+    message. Wait for me to run the profiling or testing commands in my
+    VM and report back the results before you generate the next commit.
+    Do not dump all the code or multiple steps at once."
+
+Why I worked this way:
+
+    Nothing is committed before it is measured. Each optimization has
+    its own results/*_comparison.txt showing predicted against measured,
+    including the ones where the prediction was wrong.
+
+    I run the commands. Every pyperf run, perf record, cProfile run,
+    iverilog simulation and flame graph render in this repository was
+    executed by me in the QEMU VM, and I read the output before the
+    next step was written. The software timings come from benchmark
+    runs. Hardware frequency, area and end-to-end speedup are estimates;
+    the decoder's cycle counts come from simulation.
+
+    One change per commit. If a step could not be described in a single
+    commit message, it was too big and was split.
+
+
+================================================================================
+ 2. PROMPT LOG, BY TASK
+================================================================================
+
+2.1 Understanding the benchmarks before touching them
+
+    Asked for a walk through of what bm_raytrace and bm_pyflate
+    actually do: the classes, the call structure, the compression
+    formats pyflate implements, and which parts of the code the
+    measured workload really exercises.
+
+    Why: I wanted the execution path that the benchmark measures, not
+    the one the source suggests. Section 1.3 of report_pyflate.txt
+    exists because of this - the BZ2 path dominates and the gzip path
+    is barely touched.
+
+2.2 Baseline measurement
+
+    Asked how to run each benchmark under pyperf and what settings make
+    runs comparable.
+
+    Decision I made: fix -p 10 -w 1 -n 5 for every measurement in the
+    project, so numbers from different stages can be compared directly.
+
+2.3 Getting perf to work in the VM
+
+    Asked why perf returned zero samples in the guest.
+
+    Answer: the QEMU guest exposes no PMU, so the hardware cycles event
+    counts nothing. Switched to the cpu-clock software event and
+    relaxed kptr_restrict.
+
+    What I took from it: these profiles measure elapsed time, not
+    retired cycles. That is stated in both reports rather than left
+    implicit, because it changes how the numbers should be read.
+
+2.4 Separating the profiler from pyperf
+
+    Asked for a way to profile a single process.
+
+    Why: pyperf forks a worker process per measured value, which
+    scatters perf samples across processes and makes the profile
+    useless. profile_raytrace.py and profile_pyflate.py exist to give
+    perf one process to follow.
+
+2.5 Flame graphs: collection
+
+    Asked for flame graph generation from the perf data.
+
+    First attempt used frame-pointer unwinding against python3-dbg and
+    produced return addresses like 0xfdfdfdfdfd000053. I asked what
+    those were: a debug build paints freed memory with 0xFD
+    (PYMEM_FORBIDDENBYTE) and 0xDD (PYMEM_DEADBYTE), and the unwinder
+    was walking painted memory and reporting fill bytes as frames.
+    Switched to DWARF unwinding, which needs the debug build.
+
+2.6 Flame graphs: after the optimizations, and a comparison
+
+        "what about the flame graph after the optimizations? and what
+        about a comparision for all the optimizations togother?"
+
+    This produced the flamecmp stage, which regenerates BOTH profiles
+    with identical parameters and renders a differential graph. The
+    baseline is re-recorded rather than reused, because otherwise the
+    difference between the two graphs would partly reflect the
+    collection settings instead of the optimizations.
+
+2.7 Flame graphs: keeping earlier work
+
+        "I want to keep the previous flame_graphs and just add the new
+        ones to the repo"
+
+2.8 Flame graphs: presentation
+
+        "can you make it look neater like from down to up and change
+        the titles of the graphs to fit names?"
+
+2.9 Flame graphs: rejecting py-spy
+
+        "I want to use perf and not py-spy like the project
+        instructions ask"
+
+    py-spy had been introduced to get Python-level function names,
+    because CPython 3.10 predates the perf trampoline support added in
+    3.12. I rejected it and had it removed along with everything
+    generated by it. The project instructions ask for perf, and the
+    C-level view is the only one that shows frame allocation cost,
+    which is what the raytrace optimizations were aimed at. cProfile
+    supplies the Python-level attribution instead.
+
+2.10 Flame graphs: size
+
+        "what now I want the graphs smaller with perf"
+
+    This produced tools/collapse_interpreter.py, which folds each run
+    of CPython call plumbing into one [python call] frame, and the
+    --minwidth threshold. Reaching one Python call costs a repeating
+    cycle of seven C frames, which is why the graph was 127 rows tall
+    with _PyEval_Vector appearing 809 times.
+
+2.11 Flame graphs: dropping DWARF
+
+        "lets not use the dwarf flag so it looks like the other graphs,
+        isn't ths the way?"
+
+    This was the most consequential call I made. DWARF unwinding
+    requires python3-dbg, and that build's debug allocator was ~12% of
+    the profile. It inflates optimizations that work by not allocating,
+    which made raytrace read 1.79x against pyperf's 1.60x. Profiling
+    the stock interpreter brought perf to 1.59x and confirmed the
+    diagnosis. The cost is stack depth, because Ubuntu builds python3
+    with -fomit-frame-pointer, and I accepted that trade.
+
+2.12 Flame graphs: comparability
+
+    After that change the optimized graph was TALLER than the baseline
+    despite being faster. Asked why.
+
+    Cause: --minwidth is a percentage of each run's own total. The
+    optimized run is shorter, so the same percentage was a smaller
+    absolute cutoff and admitted thinner stacks. Had it regenerated
+    with an equal ABSOLUTE threshold, 1% of the baseline on both sides,
+    so the two graphs differ because of the optimizations rather than
+    the rendering.
+
+2.13 Flame graphs: the unfiltered pair
+
+    Asked whether the graphs matched what the course slides show, which
+    use perf's built-in 'perf script report flamegraph'.
+
+    Finding: that report cannot run in this VM, because perf here is
+    not linked against libpython and executes no Python report scripts.
+    Since the built-in applies no folding and no width threshold, the
+    flameraw stage reproduces what it would have shown by dropping
+    those two steps.
+
+2.14 Understanding the filter I had asked for
+
+        "what does the frames under 1% of baseline time omitted means
+        exactly and do we acctually need them for the project and to
+        show the optimization?"
+
+    Answer, checked against the files: it is a rendering threshold that
+    changes no measurement; dropped boxes keep their time inside their
+    parents. 572 of 594 boxes in the pyflate baseline fall under it,
+    and the widest one is 57 ms of a 5.78 s run.
+
+2.15 Scope control on the unfiltered graphs
+
+        "ok do we need also the diff for the unfiltered graphs?"
+
+    Decided against it. difffolded.pl matches stacks as exact strings,
+    and unresolved towers that differ in depth between the two runs
+    would be reported as wholly added and wholly removed rather than
+    compared. The result would look dramatic and mean nothing.
+
+2.16 Optimizations
+
+    Each one was requested as a single change with a predicted gain,
+    then measured before the next was started:
+
+        raytrace    hoist the loop-invariant shadow ray; remove the
+                    no-op type assertions; add __slots__.
+        pyflate     inline the bit-mask helper; rewrite move_to_front;
+                    length-indexed Huffman decode; hoist the RLE loop
+                    length checks; batch literal spans.
+
+    The direction came from the profile rather than from intuition.
+    cProfile showed 3.1 million Python calls per 100x100 raytrace
+    frame, and perf showed ~10.9% of self time in call and frame
+    machinery, so the changes worth making were the ones that eliminate
+    calls, not the ones that make arithmetic faster. None of the three
+    raytrace optimizations touches the arithmetic.
+
+2.17 Hardware accelerator
+
+    Asked for a SystemVerilog implementation of the canonical Huffman
+    decoder, with the interface, the datapath and the control logic.
+
+    Why this component: it is genuine sequential algorithmic work
+    rather than interpreter overhead, which is what makes it worth
+    moving to hardware. I applied the same test to raytrace and
+    concluded against building one there - a dot-product unit would
+    remove five floating-point operations per call while leaving the
+    interpreter overhead that dominates, and the C API call needed to
+    reach it would cost more than the arithmetic it replaced. That
+    argument is section 5 of report_raytrace.txt.
+
+    I required co-verification rather than a standalone design: vectors
+    are generated from the Python model, and the testbench is run both
+    with a always-ready sink and with backpressure.
+
+2.18 Reports and documentation
+
+    Drafted from the measurements, then checked line by line against
+    the result files. Several passes were spent on inconsistencies:
+    stale references to the DWARF configuration after the switch to
+    frame pointers, a claim that the flame stage runs the debug
+    interpreter when it no longer did, and a duplicated comment block.
+
+2.19 Reproducibility check
+
+        "give me the exact command used to generate the flamegraphs"
+
+    Asked so that the command in the documentation could be checked
+    against the command in the scripts, rather than trusted.
+
+
+================================================================================
+ 3. VERIFICATION THAT DOES NOT DEPEND ON THE TOOL
+================================================================================
+
+    raytrace        Rendered output compared byte for byte against the
+                    pristine benchmark (script_raytrace.sh verify).
+                    The optimizations do not reassociate arithmetic, so
+                    the images are expected to be identical bit for
+                    bit, not merely close.
+
+    pyflate         The benchmark verifies itself: bench_pyflake raises
+                    on an MD5 mismatch, so a completed run is proof of
+                    correct decompression.
+
+    Huffman lookup  tests/test_huffman_equivalence.py compares the
+                    original and optimized Python decoders in both
+                    bit directions.
+
+    accelerator     hw/huffman_decoder_tb.sv checks the SystemVerilog
+                    against vectors generated from the Python tables,
+                    with and without backpressure.
+
+    timings         pyperf compare_to, identical settings on both
+                    sides.
+
+Every claim in the reports can be reproduced with the two shell scripts.
+
+
+================================================================================
+ 4. MY DESIGN IDEAS, WRITTEN AS RECONSTRUCTED PROMPTS
+================================================================================
+
+These drafts expand the decisions in 2.16 and 2.17. I have written them
+as requests to help implement, check and explain the changes I proposed.
+The file references connect each draft to the work it describes; they
+are not conversation records. The wording below was written afterwards.
+
+
+4.1 How I want to approach the changes
+
+    I've chosen raytrace and pyflate. I want to keep the original
+    benchmarks and work in separate _opt copies so I can always compare
+    against the starting point. My plan is to reduce repeated work,
+    Python calls and temporary objects in the hot paths, while keeping
+    the same workload. Help me work through one change at a time. For
+    each idea, explain what cost it should remove and give me the
+    commands to measure it with -p 10 -w 1 -n 5. I'll run the commands
+    and bring back the results before we move on.
+
+    Files: bm_raytrace_opt/run_benchmark.py,
+           bm_pyflate_opt/run_benchmark.py, script_raytrace.sh,
+           script_pyflate.sh.
+
+
+4.2 Raytrace: build the shadow ray once
+
+    In _lightIsVisible, we're constructing Ray(p, l - p) inside the
+    loop over scene objects, but p and l don't change in that loop.
+    I'd move that construction above the loop and reuse the same ray
+    for each intersection test. The constructor also normalizes the
+    vector, so this should save more than just creating one object.
+    Check that neither intersectionTime implementation modifies the
+    ray, then help me make this change. Keep the early return when an
+    object blocks the light. I want to compare the rendered pixels as
+    well as the timing.
+
+    Files: bm_raytrace_opt/run_benchmark.py,
+           results/raytrace_opt1_comparison.txt.
+
+
+4.3 Raytrace: remove the redundant vector checks
+
+    Vector.mustBeVector just returns self, and we're calling it in
+    some very busy methods. For the vector arguments this benchmark
+    passes, those calls aren't doing useful work. I want to remove
+    other.mustBeVector() from Vector.__sub__, Vector.dot, Vector.cross
+    and Point.__add__. Help me check the callers first. Leave the
+    isPoint branches alone because they decide whether the result is
+    a Point or a Vector. Then measure this separately from the shadow
+    ray change and check that the image still matches.
+
+    Files: bm_raytrace_opt/run_benchmark.py,
+           results/raytrace_opt2_comparison.txt.
+
+
+4.4 Raytrace: use slots for the small geometry objects
+
+    These geometry classes have a fixed set of attributes, and we
+    create a lot of instances. I think __slots__ is worth trying here
+    to reduce their storage overhead and the cost of attribute access.
+    I'd use x, y, z for Vector and Point; point, vector for Ray;
+    centre, radius for Sphere; and point, normal for Halfspace.
+    Check for assignments outside those fields before adding the
+    slots. Keep this as its own change so I can see what it adds to
+    the first two optimizations.
+
+    Files: bm_raytrace_opt/run_benchmark.py,
+           results/raytrace_opt3_comparison.txt.
+
+
+4.5 Pyflate: inline the small mask calculation
+
+    _mask shows up hundreds of thousands of times, but its whole body
+    is (1 << n) - 1. I'd put that expression directly in snoopbits
+    and readbits in both Bitfield and RBitfield. In RBitfield.readbits
+    we need the same mask twice, so calculate it once and keep it in a
+    local. Help me check that the shifts and bit counts stay exactly
+    the same. This is a small change, so let's measure it on its own
+    before touching the Huffman lookup.
+
+    Files: bm_pyflate_opt/run_benchmark.py,
+           results/pyflate_opt1_comparison.txt.
+
+
+4.6 Pyflate: move one list item without rebuilding the list
+
+    move_to_front creates slices and joins them just to move the item
+    at index c to the front. I'd replace the body with
+    l.insert(0, l.pop(c)). That keeps the same list object and the
+    order of the other items for the valid indices used here, without
+    creating all those temporary lists. Check the callers, including
+    the selector list, and help me make the replacement. I want the
+    decompression checksum and a separate timing for this change.
+
+    Files: bm_pyflate_opt/run_benchmark.py,
+           results/pyflate_opt2_comparison.txt.
+
+
+4.7 Pyflate: look up Huffman symbols by code length
+
+    find_next_symbol walks the table entry by entry for every decoded
+    symbol. My idea is to build dictionaries once when the canonical
+    codes are populated, grouped by bit length. Then decoding only
+    needs to try the lengths that actually occur and look up the bits
+    it sees. Keep forward and reversed dictionaries because the code
+    is shared by bzip2 and DEFLATE. Preserve the original first-match
+    behavior if entries collide, and only consume bits after a match.
+    Help me implement this in _build_lookup and find_next_symbol.
+
+    The bundled input only exercises bzip2, so its MD5 check won't
+    cover the reversed lookup. I also want a comparison against the
+    original decoder in both directions, checking the returned symbol,
+    bits consumed and whether a lookup raises.
+
+    Files: bm_pyflate_opt/run_benchmark.py,
+           tests/test_huffman_equivalence.py,
+           results/pyflate_opt3_comparison.txt.
+
+
+4.8 Pyflate: take repeated work out of the RLE loop
+
+    The bytes returned by bwt_reverse don't change while the RLE loop
+    is running. I'd calculate end = len(nt) and limit = end - 4 once,
+    before the loop. Also, nt[i + 4] already gives an integer, so we
+    can use that instead of taking a one-byte slice and calling ord.
+    Help me apply those changes while keeping the same run detection
+    and boundary condition. Let's measure this before changing how
+    literal bytes are appended, so the two effects stay separate.
+
+    Files: bm_pyflate_opt/run_benchmark.py,
+           results/pyflate_opt4_comparison.txt.
+
+
+4.9 Pyflate: append literal stretches together
+
+    We're still making a one-byte object and appending it for every
+    literal in the final RLE loop. I want to track where a stretch of
+    literals starts, then append that whole slice when we reach an
+    encoded run. Append the expanded run and start tracking again
+    after it. There also needs to be a final append for any literals
+    left at the end. Bind out.append to a local while we're here.
+    Help me check the boundaries, especially consecutive runs and
+    trailing literals, then compare the checksum and timing.
+
+    Files: bm_pyflate_opt/run_benchmark.py,
+           results/pyflate_opt5_comparison.txt.
+
+
+4.10 Checking what the software changes actually achieved
+
+    I want one comparison of the original and final versions of both
+    benchmarks, using the same settings in a single session. Keep the
+    individual results too, including predictions that missed. In the
+    explanation, distinguish a percentage reduction in runtime from
+    a speedup factor. For raytrace, compare the actual PPM files. For
+    pyflate, keep the MD5 check and the separate Huffman equivalence
+    test. Help me connect each result to the change that caused it.
+
+    Files: results/optimization_summary.txt, script_raytrace.sh,
+           script_pyflate.sh, tests/test_huffman_equivalence.py.
+
+
+4.11 My choice of hardware target
+
+    For the hardware part, I want to accelerate pyflate's Huffman
+    decoding together with its bit reading. It still accounts for
+    about half of the optimized runtime in the analysis, so there is
+    a substantial amount of work left to remove. I'd keep header
+    parsing, table construction, move-to-front, inverse BWT and RLE
+    in software. Help me check that boundary and explain why it fits
+    the profile. For raytrace, a small dot-product unit would leave
+    the Python calls and object handling in place, which makes it a
+    less useful target for this project.
+
+    Files: results/pyflate_accel_analysis.txt,
+           report_pyflate.txt section 5, report_raytrace.txt section 5.
+
+
+4.12 My decoder architecture: check the code lengths in parallel
+
+    I want to use the canonical structure of the Huffman tables in
+    the hardware. For each length L, store first_code[L], count[L]
+    and base_index[L], plus a flat symbol table. Take a candidate from
+    the next L bits and check first_code[L] <= candidate and
+    candidate - first_code[L] < count[L]. If it matches, the symbol
+    address is base_index[L] + candidate - first_code[L].
+
+    My plan is to check lengths 1 through 20 in parallel, select the
+    shortest match, and register the table and symbol index for the
+    output stage. Use a 64-bit MSB-aligned buffer fed by 32-bit words,
+    matching the bzip2 bit order. Help me turn this into SystemVerilog
+    with the datapath and control needed to aim for one symbol per
+    cycle once the pipeline is running.
+
+    Files: hw/huffman_decoder.sv, hw/block_diagram.txt,
+           hw/block_diagram.svg.
+
+
+4.13 Keep table switching inside the accelerator
+
+    bzip2 changes Huffman groups every 50 symbols. I don't want Python
+    to have to intervene at each switch, so I'd load the selector list
+    before starting and let the hardware walk it. Support up to six
+    tables, 258 symbols per table and 9-bit symbol values. Help me
+    implement the group counter and selector pointer. The table ID
+    needs to travel with the symbol index into the output stage so
+    that a group switch can't change a symbol already in flight.
+
+    File: hw/huffman_decoder.sv.
+
+
+4.14 Handle stalls and the end of a block
+
+    I want ready/valid handshakes on both streams. If the output
+    stalls, hold the pending symbol and only consume another code
+    when the pipeline has space. An incomplete input buffer should
+    wait for more bits; a missing match should only become an error
+    once all allowed lengths could have been checked.
+
+    Also add start, busy, done, error, symbol_count and final_bit_pos.
+    Carry the consumed bit position with the decoded symbol and save
+    the position immediately after EOB when it completes. Software
+    needs that exact offset to resume parsing. Exclude EOB from the
+    body-symbol count and stop decoding past it. Help me review those
+    conditions around stalls and group boundaries.
+
+    File: hw/huffman_decoder.sv.
+
+
+4.15 Transfer a whole block of symbols back to software
+
+    For integration, my proposal is to send compressed data through
+    DMA and receive the decoded symbols into a buffer. Reading one
+    symbol at a time from Python would add overhead to every decode.
+    I'd expose one hw_decode_block call returning the symbol array
+    and next bit position, with AXI4-Lite for control and table loading
+    and streaming ports for data. Help me draw the system connection
+    and explain the software steps. The current RTL implements the
+    decoder and its simple ports; the AXI adapters, DMA, driver and
+    Python binding belong to the integration proposal.
+
+    Files: hw/block_diagram.txt, hw/block_diagram.svg,
+           report_pyflate.txt sections 5.5-5.6.
+
+
+4.16 Verify the hardware using the Python tables
+
+    I want the test vectors to come from the benchmark's own
+    OrderedHuffmanTable objects. Extract the canonical parameters
+    and encode a known symbol sequence using those populated tables.
+    Build valid code lengths from a Huffman tree so the stimulus is
+    prefix-free. Use two groups alternating every 50 symbols, cross
+    input-word boundaries, and finish with EOB.
+
+    Help me write the generator and testbench. Compare every output
+    symbol with the expected sequence, then check symbol_count and
+    the exact final_bit_pos. Run with an always-ready sink and again
+    with output stalls. Record the cycle counts and which cases the
+    vectors cover, so the simulation results have a clear scope.
+
+    Files: hw/gen_test_vectors.py, hw/vectors/*.hex,
+           hw/huffman_decoder_tb.sv, results/huffman_sim.txt.
+
+
+4.17 Estimate the benefit and explain the hardware trade-offs
+
+    I want the speedup estimate to start from the optimized software,
+    because that's what this accelerator would replace. Use the
+    measured Huffman fraction and the simulated cycles per symbol,
+    then apply Amdahl's law. Treat 200 MHz as a design target and show
+    how the answer changes at a lower frequency. Include the costs
+    and assumptions for table loading and data transfers.
+
+    I'd also like to compare my parallel length checks with reusing
+    one comparator over several cycles. Explain the area, throughput
+    and power trade-offs, including the selector memory. Keep the
+    measured software results, simulated decoder results and expected
+    system speedup clearly identified. We haven't synthesized this
+    design or measured a complete hardware/software system.
+
+    Files: results/pyflate_accel_analysis.txt,
+           report_pyflate.txt sections 5.7-5.9.
+
+
+4.18 Explain the decisions in the report and presentation
+
+    Help me write this in the same order I would explain it to another
+    student: what the benchmark does, what the profile showed, the
+    change I proposed, and what happened when it was measured. For
+    the hardware, walk through the bit buffer, parallel comparisons,
+    symbol lookup and group switching using the block diagram.
+    Keep the language straightforward and use the actual result files
+    for the numbers. Include the simulation limits and the remaining
+    integration work so I can explain what has been demonstrated.
+
+    Files: report_raytrace.txt, report_pyflate.txt, README.md,
+           presentation_outline.md.
