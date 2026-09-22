@@ -179,14 +179,6 @@ stage_flame() {
     # ADJACENT duplicate frames, and this is a cycle of seven distinct
     # names. Sample counts are preserved exactly either way.
     #
-    # HEIGHT, and the box count that follows from it. Reaching one Python
-    # call costs a cycle of seven C frames (_PyEval_Vector,
-    # _PyEval_EvalFrame, _PyEval_EvalFrameDefault, call_function,
-    # PyObject_Vectorcall, _PyObject_VectorcallTstate,
-    # _PyFunction_Vectorcall) and that cycle repeats once per level of
-    # Python call depth. Measured on the previous graph: _PyEval_Vector
-    # appeared 809 times and the image was 127 rows tall.
-    #
     # Sub-1% frames are too thin to carry a label and are most of the
     # file size, so they are dropped rather than rendered.
     local minwidth=1
