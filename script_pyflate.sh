@@ -11,6 +11,8 @@
 #   ./script_pyflate.sh cprofile   per-function profile of both variants
 #   ./script_pyflate.sh flame      perf record + flame graph
 #   ./script_pyflate.sh flamecmp   baseline vs optimized + diff flame graph
+#   ./script_pyflate.sh flameraw   unfiltered graph, as the built-in
+#                                  perf report would have drawn it
 #   ./script_pyflate.sh hw         compile and simulate the accelerator
 #   ./script_pyflate.sh all        everything except setup
 #
@@ -281,6 +283,85 @@ stage_flamecmp() {
 }
 
 
+stage_flameraw() {
+    say "unfiltered flame graph"
+
+    local fg
+    fg="$(dirname "$(find "$HOME" -name stackcollapse-perf.pl 2>/dev/null \
+          | head -1)")"
+    if [ ! -x "$fg/stackcollapse-perf.pl" ]; then
+        echo "FlameGraph not found; run '$0 setup' first" >&2
+        return 1
+    fi
+
+    # The course slides show perf's built-in shortcut:
+    #
+    #     perf record -a -g -F 99 sleep 60
+    #     perf script report flamegraph
+    #
+    # That report cannot run in this VM: perf is not linked against
+    # libpython and so executes no Python report scripts at all, and
+    # the d3 template package it needs is not in the archive. The
+    # renderer is not the interesting difference in any case. The
+    # built-in draws whatever perf script emits, with no frame folding
+    # and no width threshold, while flamecmp applies both; this stage
+    # reproduces what the built-in would have SHOWN by dropping those
+    # two steps and changing nothing else. See stage_flameraw in
+    # script_raytrace.sh for the full reasoning and for why -e cpu-clock
+    # and -F 999 depart from the slide.
+    local variant
+    for variant in "$BASE_DIR" "$OPT_DIR"; do
+        echo "--- profiling $variant ---"
+        perf record -e cpu-clock -F 999 -g \
+            -o "/tmp/${variant}_raw.data" \
+            -- python3 "$REPO/profile_pyflate.py" \
+                  --variant "$variant" --loops 5
+
+        # No collapse_interpreter.py in the pipe, and no --minwidth on
+        # the renderer below. Those two omissions are the entire point
+        # of the stage, so they are deliberate, not oversights.
+        perf script -i "/tmp/${variant}_raw.data" \
+            | "$fg/stackcollapse-perf.pl" > "/tmp/${variant}_raw.folded"
+    done
+
+    local sub="every frame as perf reports it: no folding, no width filter"
+
+    "$fg/flamegraph.pl" \
+        --title "pyflate BASELINE (unfiltered, cpu-clock)" \
+        --subtitle "$sub" \
+        "/tmp/${BASE_DIR}_raw.folded" \
+        > "$RESULTS/pyflate_baseline_flame_raw.svg"
+
+    "$fg/flamegraph.pl" \
+        --title "pyflate OPTIMIZED (unfiltered, cpu-clock)" \
+        --subtitle "$sub" \
+        "/tmp/${OPT_DIR}_raw.folded" \
+        > "$RESULTS/pyflate_optimized_flame_raw.svg"
+
+    echo
+    echo "wrote:"
+    ls -la "$RESULTS"/pyflate_baseline_flame_raw.svg \
+           "$RESULTS"/pyflate_optimized_flame_raw.svg
+
+    # The processed graphs sit beside these, so the cost of leaving the
+    # stacks unprocessed is worth stating in numbers rather than
+    # leaving to the eye: distinct frames drive the box count and the
+    # file size, and depth drives the height.
+    say "what the processing steps remove"
+    local v
+    for v in "$BASE_DIR" "$OPT_DIR"; do
+        # The trailing " <count>" belongs to the leaf frame, not to the
+        # frame name, so it comes off before the stack is split.
+        awk -v tag="$v" \
+            '{sub(/ [0-9]+$/, ""); d=split($0, p, ";")
+              s+=d; n++; if(d>m)m=d
+              for(i=1;i<=d;i++) if(!(p[i] in f)) {f[p[i]]=1; u++}}
+             END {printf "%-18s mean depth %.1f, max %d, %d distinct frames\n",
+                          tag, s/n, m, u}' "/tmp/${v}_raw.folded"
+    done
+}
+
+
 stage_hw() {
     say "hardware: regenerate vectors from the Python model"
     python3 "$REPO/hw/gen_test_vectors.py"
@@ -310,6 +391,7 @@ main() {
         cprofile)  stage_cprofile ;;
         flame)     stage_flame ;;
         flamecmp)  stage_flamecmp ;;
+        flameraw)  stage_flameraw ;;
         hw)        stage_hw ;;
         all)
             stage_baseline
@@ -318,6 +400,7 @@ main() {
             stage_cprofile
             stage_flame
             stage_flamecmp
+            stage_flameraw
             stage_hw
             ;;
         default)
@@ -327,7 +410,7 @@ main() {
             ;;
         *)
             echo "unknown stage: $1" >&2
-            sed -n '3,20p' "${BASH_SOURCE[0]}" >&2
+            sed -n '3,22p' "${BASH_SOURCE[0]}" >&2
             exit 1
             ;;
     esac
