@@ -162,7 +162,13 @@ that is merely applied, and the target was already exceeded.
     results/pyflate_optimized_flame.svg
     results/pyflate_diff_flame.svg
 
+    results/raytrace_baseline_flame_raw.svg     unprocessed
+    results/raytrace_optimized_flame_raw.svg    unprocessed
+    results/pyflate_baseline_flame_raw.svg      unprocessed
+    results/pyflate_optimized_flame_raw.svg     unprocessed
+
 Regenerate with:  ./script_<name>.sh flamecmp
+                  ./script_<name>.sh flameraw   for the _raw pair
 
 How they are collected
 
@@ -191,6 +197,31 @@ How they are collected
        1% of the baseline is now the common threshold and the optimized
        percentage is scaled by the ratio of the totals. This matters for
        the same reason the collection parameters are held identical.
+
+The unprocessed pair
+
+    The *_flame_raw.svg files are the same recordings with none of
+    those three steps applied. The course material generates flame
+    graphs with perf's own built-in shortcut instead:
+
+        perf record -a -g -F 99 sleep 60
+        perf script report flamegraph
+
+    That report cannot run in this VM. perf here is not linked against
+    libpython, so it executes no Python report scripts at all, and the
+    template package it needs, libjs-d3-flame-graph, is not in the
+    archive. The built-in draws whatever perf script emits, with no
+    folding and no width threshold, so dropping the three steps above
+    reproduces what it would have shown.
+
+    The cost of the processing is then visible directly rather than
+    asserted: for pyflate, 594 boxes and 2158 pixels of height
+    unprocessed, against 83 boxes and 158 pixels processed. 65% of
+    those boxes are [unknown], which is also why no differential is
+    generated from them - difffolded.pl matches stacks as exact
+    strings, and unresolved towers that differ in depth between the two
+    runs would be reported as wholly added and wholly removed rather
+    than compared.
 
 Reading the differential graphs
 
