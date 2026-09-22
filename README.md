@@ -131,12 +131,14 @@ results/pyflate_accel_analysis.txt        speedup estimate for the hardware
 results/huffman_sim.txt                   accelerator verification
 ```
 
-Flame graphs, three per benchmark, all from `perf`:
+Flame graphs, five per benchmark, all from `perf`:
 
 ```
 results/<name>_baseline_flame.svg         before
 results/<name>_optimized_flame.svg        after
 results/<name>_diff_flame.svg             differential
+results/<name>_baseline_flame_raw.svg     before, unprocessed
+results/<name>_optimized_flame_raw.svg    after, unprocessed
 ```
 
 These are collected with `perf record -e cpu-clock -g` and rendered with
@@ -204,6 +206,37 @@ the earlier DWARF graphs required `python3-dbg`, whose debug allocator was ~12%
 of the profile and inflated optimizations that work by not allocating, making
 raytrace read 1.79x. Profiling the stock interpreter closed the gap and
 confirmed the diagnosis — see `results/optimization_summary.txt`.
+
+The `*_flame_raw.svg` pair is the same data with none of that processing. The
+course slides produce flame graphs with `perf`'s built-in shortcut:
+
+```bash
+perf record -a -g -F 99 sleep 60
+perf script report flamegraph
+```
+
+That report cannot run in this VM. `perf` here is not linked against
+libpython, so it executes no Python report scripts at all,
+`/usr/libexec/perf-core/scripts` does not exist, and the template package the
+report needs, `libjs-d3-flame-graph`, is not in the archive. Only the last of
+those is installable and it is useless without the first, so the literal
+command would require building `perf` from source.
+
+The renderer is not the interesting difference in any case. The built-in
+report draws whatever `perf script` emits, with no frame folding and no width
+threshold — exactly the two steps described above. So `./script_<name>.sh
+flameraw` re-records the benchmark and renders it with neither, which is what
+the built-in would have shown. Its two departures from the slide's flags are
+forced rather than chosen: `-e cpu-clock` because the guest exposes no PMU,
+and no `-a` because the subject is a single process that runs to completion
+rather than a system sampled for a fixed minute. `-F 999` follows from the
+same arithmetic — 99 Hz over 60 s is roughly 6,000 samples, and these
+benchmarks finish in a few seconds.
+
+The unprocessed graphs are 92–128 KB against 26–31 KB for the processed ones,
+with mean stack depths of 4.6 to 8.9 frames and a tail that reaches perf's
+128-frame ceiling. They are checked in as the comparison point, not as the
+graphs the analysis was done on.
 
 Each `*_comparison.txt` records the change, the predicted gain, the measured
 gain, and the correctness evidence — including the cases where the prediction
