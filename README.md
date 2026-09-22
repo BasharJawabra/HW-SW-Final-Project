@@ -139,9 +139,9 @@ results/<name>_optimized_flame.svg        after
 results/<name>_diff_flame.svg             differential
 ```
 
-These are collected with `perf record -e cpu-clock --call-graph dwarf` and
-rendered with Brendan Gregg's `flamegraph.pl`. Two things about them need
-stating up front, because both look like defects otherwise.
+These are collected with `perf record -e cpu-clock -g` and rendered with
+Brendan Gregg's `flamegraph.pl`. Three things about them need stating up
+front, because each one looks like a defect otherwise.
 
 They are collected with frame-pointer unwinding (`-g`) against the **stock**
 `python3`, not DWARF against `python3-dbg`. Those two choices are inseparable:
